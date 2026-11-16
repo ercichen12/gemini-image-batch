@@ -5,7 +5,7 @@
 // @version      1.0.0
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
-// @author       chenjunqiang
+// @author       ercichen12
 // @match        https://gemini.google.com/*
 // @grant        GM_download
 // @connect      googleusercontent.com
