@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.5.4
+// @version      1.5.5
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.5.4';
+    const VER = '1.5.5';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -509,18 +509,21 @@
         }
     }
 
-    /** gg-dl 地址默认给缩略图，换尺寸参数能要到更大的版本 */
+    /**
+     * gg-dl 地址默认给缩略图。=s0 只保证最大边长，仍是压缩版；
+     * =d 才是原始文件（同尺寸下体积明显更大）。所以 =d 优先。
+     */
     function sizeVariants(u) {
-        const out = [u];
+        const out = [];
         try {
             const m = /=[^=\/]+$/.exec(u);
             const base = m ? u.slice(0, m.index) : u;
             const add = (s) => { if (out.indexOf(s) === -1 && out.length < 5) out.push(s); };
-            add(base + '=s0');
             add(base + '=d');
-            if (!m) add(u + '=s0');
+            add(base + '=s0');
+            add(u);
         } catch (e) { }
-        return out;
+        return out.length ? out : [u];
     }
 
     /** 记录尺寸和体积，用来自证取到的是不是原图 */
@@ -939,7 +942,10 @@
             }
             const d = await blobSize(cands[i].blob);
             log(`  候选 ${cands[i].via}：${t.replace('image/', '')} ${d.w}×${d.h} ${(cands[i].blob.size / 1048576).toFixed(2)}MB`);
-            if (!best || d.w > best.w) best = { blob: cands[i].blob, via: cands[i].via, w: d.w, h: d.h };
+            // 先比宽度，同宽度再比体积（同尺寸下 =d 的原始文件明显更大）
+            const better = !best || d.w > best.w ||
+                (d.w === best.w && cands[i].blob.size > best.blob.size);
+            if (better) best = { blob: cands[i].blob, via: cands[i].via, w: d.w, h: d.h };
         }
 
         if (best && best.w >= MIN_FULL_W) {
