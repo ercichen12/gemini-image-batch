@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.3.2
+// @version      1.4.0
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.3.2';
+    const VER = '1.4.0';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -712,12 +712,100 @@
         return new Blob([arr], { type });
     }
 
+    /* --------------------- 生成阶段探针（不点按钮的取图路线） ---------------------
+     * 页面显示的是 blob: 图，说明生成过程中必然请求过一次真实图片字节。
+     * 在整轮生成期间挂探针，把这类响应直接收下来，就绕开了下载按钮。
+     */
+
+    let netProbe = null;
+
+    function stopNetProbe() {
+        if (netProbe && netProbe.stop) { try { netProbe.stop(); } catch (e) { } }
+        netProbe = null;
+    }
+
+    function startNetProbe() {
+        stopNetProbe();
+        const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+        const urls = [];
+        const seen = new Set();
+        const undo = [];
+        let active = true;
+        let biggest = null;
+
+        const note = (u) => {
+            try {
+                const s = String(u || '');
+                if (!s || seen.has(s)) return;
+                if (!/googleusercontent|gg-dl|\/image|\.(jpe?g|png|webp)/i.test(s)) return;
+                seen.add(s);
+                if (urls.length < 40) urls.push(s);
+            } catch (e) { }
+        };
+
+        try {
+            const of = uw.fetch;
+            undo.push(() => { uw.fetch = of; });
+            uw.fetch = function (input) {
+                if (!active) return of.apply(this, arguments);
+                const u = typeof input === 'string' ? input : (input && input.url) || '';
+                note(u);
+                const p = of.apply(this, arguments);
+                try {
+                    if (p && typeof p.then === 'function') {
+                        p.then((res) => {
+                            try {
+                                const ct = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
+                                if (!/^image\//i.test(ct)) return;
+                                res.clone().blob().then((b) => {
+                                    if (b && b.size > 8192 && (!biggest || b.size > biggest.size)) biggest = b;
+                                }).catch(() => { });
+                            } catch (e) { }
+                        }).catch(() => { });
+                    }
+                } catch (e) { }
+                return p;
+            };
+        } catch (e) { }
+
+        try {
+            const xp = uw.XMLHttpRequest && uw.XMLHttpRequest.prototype;
+            if (xp) {
+                const oo = xp.open;
+                undo.push(() => { xp.open = oo; });
+                xp.open = function (m, u) { if (active) note(u); return oo.apply(this, arguments); };
+            }
+        } catch (e) { }
+
+        netProbe = {
+            urls,
+            get blob() { return biggest; },
+            stop() {
+                active = false;
+                undo.reverse().forEach((fn) => { try { fn(); } catch (e) { } });
+            }
+        };
+        return netProbe;
+    }
+
     /** 保存单张：优先原图，绝不落 webp */
-    async function saveOneImage(img, baseName) {
+    async function saveOneImage(img, baseName, preferred) {
         if (!img || !img.src) throw new Error('图片元素无效');
         const src = img.src;
         const scope = imageScope(img);
         let fallback = null;
+
+        // 0) 生成阶段就抓到的原图字节：最干净的一条路，不碰下载按钮
+        if (preferred) {
+            try {
+                const pf = await sniffImage(preferred);
+                if (GOOD_TYPES.test(pf.type || '')) {
+                    const name = baseName + '.' + mimeToExt(pf.type);
+                    triggerDownload(pf, name);
+                    return { name, from: '生成时抓取', meta: await blobMeta(pf) };
+                }
+            } catch (e) { }
+        }
 
         // 先看清页面这张图本身是什么规格，判断它是不是已经是原图
         try {
@@ -853,15 +941,16 @@
         save();
         exportAs('csv');
         setTimeout(() => exportAs('html'), 1000);
+        setTimeout(() => exportAs('log'), 2000);
     }
 
-    async function downloadAll(images, idx, prompt) {
+    async function downloadAll(images, idx, prompt, preferred) {
         const base = String(idx + 1).padStart(3, '0') + '_' + slug(prompt, 40);
         const out = [];
         for (let i = 0; i < images.length; i++) {
             const suffix = images.length > 1 ? '_' + (i + 1) : '';
             try {
-                const r = await saveOneImage(images[i].el, base + suffix);
+                const r = await saveOneImage(images[i].el, base + suffix, i === 0 ? preferred : null);
                 out.push(r);
                 log(`⬇ 已保存 ${r.name}（${r.from}${r.meta ? ' ' + r.meta : ''}）`);
                 await sleep(r.from === '按钮' ? 900 : 400);
@@ -954,6 +1043,12 @@
     }
 
     function exportAs(kind) {
+        if (kind === 'log') {
+            if (!logLines.length) { log('⚠️ 还没有日志', 'warn'); return; }
+            triggerDownload(new Blob([logText()], { type: 'text/plain;charset=utf-8' }), 'gemini-batch-log.txt');
+            log('⬇ 已导出 gemini-batch-log.txt');
+            return;
+        }
         if (!recordKeys().length) { log('⚠️ 还没有可导出的记录', 'warn'); return; }
         if (kind === 'csv') {
             triggerDownload(new Blob([buildCsv()], { type: 'text/csv;charset=utf-8' }), 'gemini-batch-manifest.csv');
@@ -1036,15 +1131,26 @@
                 baseline = new Set();
             }
 
+            startNetProbe();
             const result = await waitImages();
+            const probe = netProbe
+                ? { blob: netProbe.blob, urls: (netProbe.urls || []).slice(0, 6) }
+                : null;
+            stopNetProbe();
+
             if (result.error) {
                 const quota = /配额|限流/.test(result.error);
                 return fail(idx, result.error, quota);
             }
 
             log(`  出图 ${result.images.length} 张`);
+            if (probe && probe.blob) {
+                log(`  生成阶段抓到图片字节 ${(probe.blob.size / 1048576).toFixed(2)}MB（${probe.blob.type || '未知类型'}）`);
+            } else if (probe && probe.urls.length) {
+                log(`  生成阶段见到 ${probe.urls.length} 个疑似图片地址，未取到字节`);
+            }
             let saved = [];
-            if (S.autoDownload) saved = await downloadAll(result.images, idx, prompt);
+            if (S.autoDownload) saved = await downloadAll(result.images, idx, prompt, probe && probe.blob);
 
             const owned = (saved || []).filter((r) => r.from !== '按钮');
             updateRecord(idx, {
@@ -1128,6 +1234,7 @@
 
     let root = null;
     let ui = {};
+    const logLines = [];
 
     const PANEL_CSS = `
     * { box-sizing: border-box; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
@@ -1180,7 +1287,7 @@
     .bar i { display: block; height: 100%; width: 0%; background: #4c8dff; transition: width .3s; }
     .status { margin-top: 6px; color: #9a9aa6; font-size: 11.5px; min-height: 16px; }
     .log {
-      margin-top: 7px; height: 96px; overflow-y: auto; padding: 7px 8px;
+      margin-top: 7px; height: 150px; overflow-y: auto; padding: 7px 8px;
       background: #131316; border: 1px solid #2a2a31; border-radius: 7px;
       font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.55; color: #b9b9c3;
     }
@@ -1289,7 +1396,8 @@
             ),
             h('div', { class: 'row' },
                 h('button', { class: 'btn', id: 'btnCsv', text: '导出清单' }),
-                h('button', { class: 'btn', id: 'btnHtml', text: '对照页' })
+                h('button', { class: 'btn', id: 'btnHtml', text: '对照页' }),
+                h('button', { class: 'btn', id: 'btnLog', text: '导出日志' })
             )
         );
 
@@ -1353,7 +1461,7 @@
             pillText: $('pillText'), head: $('head'), btnMin: $('btnMin'), btnHide: $('btnHide'),
             cfgDelay: $('cfgDelay'), cfgTimeout: $('cfgTimeout'),
             cfgNewChat: $('cfgNewChat'), cfgAutoDl: $('cfgAutoDl'), btnProbe: $('btnProbe'),
-            btnCopyLog: $('btnCopyLog'), btnCsv: $('btnCsv'), btnHtml: $('btnHtml')
+            btnCopyLog: $('btnCopyLog'), btnCsv: $('btnCsv'), btnHtml: $('btnHtml'), btnLog: $('btnLog')
         };
 
         ui.ta.value = S.raw;
@@ -1407,6 +1515,7 @@
         ui.btnProbe.addEventListener('click', probe);
         ui.btnCopyLog.addEventListener('click', copyLog);
         ui.btnCsv.addEventListener('click', () => exportAs('csv'));
+        ui.btnLog.addEventListener('click', () => exportAs('log'));
         ui.btnHtml.addEventListener('click', () => exportAs('html'));
 
         // 收起 / 隐藏 / 拖动
@@ -1443,22 +1552,38 @@
     }
 
     function log(msg, cls) {
-        if (!ui.log) return;
         const t = new Date().toTimeString().slice(0, 8);
+        const line = `[${t}] ${msg}`;
+        logLines.push(line);
+        if (logLines.length > 3000) logLines.shift();
+        if (!ui.log) return;
         const div = document.createElement('div');
         if (cls) div.className = cls;
         else if (/^✓|^✅|已保存/.test(msg)) div.className = 'ok';
         else if (/^✗|失败|异常/.test(msg)) div.className = 'err';
-        else if (/⚠️|⏸/.test(msg)) div.className = 'warn';
-        div.textContent = `[${t}] ${msg}`;
+        else if (/⚠️|⏸|↳/.test(msg)) div.className = 'warn';
+        div.textContent = line;
         ui.log.appendChild(div);
         ui.log.scrollTop = ui.log.scrollHeight;
-        while (ui.log.childElementCount > 200) ui.log.firstElementChild.remove();
+        while (ui.log.childElementCount > 300) ui.log.firstElementChild.remove();
+    }
+
+    function logText() {
+        const head = [
+            '===== Gemini 批量生图 运行日志 =====',
+            '版本: v' + VER,
+            '时间: ' + new Date().toLocaleString('zh-CN'),
+            '页面: ' + location.href,
+            '队列: ' + S.queue.length + ' 条 / 进度 ' + S.cursor,
+            '====================================',
+            ''
+        ].join('\n');
+        return head + logLines.join('\n') + '\n';
     }
 
     async function copyLog() {
-        const text = ui.log ? ui.log.innerText : '';
-        if (!text.trim()) { log('⚠️ 日志为空', 'warn'); return; }
+        const text = logText();
+        if (!logLines.length) { log('⚠️ 日志为空', 'warn'); return; }
         try {
             await navigator.clipboard.writeText(text);
             log('📋 日志已复制到剪贴板，可直接粘贴');
