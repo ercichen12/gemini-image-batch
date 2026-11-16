@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.4.0
+// @version      1.4.1
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.4.0';
+    const VER = '1.4.1';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -879,10 +879,13 @@
                 }
             }
             if (blob) {
-                const out = GOOD_TYPES.test(blob.type) ? blob : await toPng(blob);
+                const good = GOOD_TYPES.test(blob.type);
+                const out = good ? blob : await toPng(blob);
                 const name = baseName + '.' + mimeToExt(out.type);
                 triggerDownload(out, name);
-                return { name, from: '原图', meta: await blobMeta(out) };
+                const via = cap.blob ? '页面blob' : (cap.href ? '下载链接' : 'RPC地址');
+                log(`  取图：${out.type || '未知'} ${(out.size / 1048576).toFixed(2)}MB · 来源 ${via}${good ? '' : '（由 webp 转码）'}`);
+                return { name, from: good ? '原图' : 'webp转png', meta: await blobMeta(out) };
             }
             if (!blob && cap.rpcCalls.length === 0) {
                 log('  ⚠️ 未取到下载请求体（可能是 Request 对象或二进制体）', 'warn');
