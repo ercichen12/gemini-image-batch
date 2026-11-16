@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.5.3
+// @version      1.5.4
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.5.3';
+    const VER = '1.5.4';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -509,6 +509,20 @@
         }
     }
 
+    /** gg-dl 地址默认给缩略图，换尺寸参数能要到更大的版本 */
+    function sizeVariants(u) {
+        const out = [u];
+        try {
+            const m = /=[^=\/]+$/.exec(u);
+            const base = m ? u.slice(0, m.index) : u;
+            const add = (s) => { if (out.indexOf(s) === -1 && out.length < 5) out.push(s); };
+            add(base + '=s0');
+            add(base + '=d');
+            if (!m) add(u + '=s0');
+        } catch (e) { }
+        return out;
+    }
+
     /** 记录尺寸和体积，用来自证取到的是不是原图 */
     async function blobMeta(blob) {
         let dim = '';
@@ -889,10 +903,16 @@
                     const text = await replayRpc(cap.rpcCalls[c]);
                     const cand = rpcCandidates(text);
                     log(`  RPC 重放：${text.length}B，地址 ${cand.urls.length} 个${cand.b64 ? '，内嵌图 ' + Math.round(cand.b64.length / 1024) + 'KB' : ''}`);
-                    if (cand.urls.length) log('  RPC 地址：' + cand.urls[0].slice(0, 160));
+                    if (cand.urls.length) {
+                        const u0 = cand.urls[0];
+                        log('  RPC 地址：' + u0.slice(0, 70) + ' … ' + u0.slice(-50));
+                    }
                     for (let u = 0; u < cand.urls.length; u++) {
-                        try { addCand(await fetchBlob(cand.urls[u]), 'RPC地址'); }
-                        catch (e) { log('  RPC 地址取图失败：' + (e.message || e), 'warn'); }
+                        const vs = sizeVariants(cand.urls[u]);
+                        for (let v = 0; v < vs.length; v++) {
+                            try { addCand(await fetchBlob(vs[v]), v === 0 ? 'RPC地址' : 'RPC改尺寸'); }
+                            catch (e) { if (v === 0) log('  RPC 地址取图失败：' + (e.message || e), 'warn'); }
+                        }
                     }
                     if (cand.b64) {
                         try { addCand(await sniffImage(b64ToBlob(cand.b64)), 'RPC内嵌图'); }
@@ -931,18 +951,20 @@
         if (best) log(`  ⚠️ 最大只到 ${best.w}×${best.h}，低于阈值 ${MIN_FULL_W}px，改走原生下载`, 'warn');
 
         // 5) 兜底：让页面自己下载，保证拿到真原图（文件名归 Google）
-        await sleep(400);
-        try {
-            await revealToolbar(scope);
-            const again = findDownloadControl(scope) || ctrl;
-            if (again && !again.disabled && again.getAttribute('aria-disabled') !== 'true') {
-                again.click();
-                log('  ↳ 已退回页面原生下载（文件名由 Google 生成）', 'warn');
-            } else {
-                log('  ⚠️ 下载按钮当前不可点，请手动点一次 Download full size', 'warn');
-            }
-        } catch (e) { }
-        return { name: '（页面原生下载，文件名由 Google 生成）', from: '按钮' };
+        for (let attempt = 0; attempt < 3; attempt++) {
+            await sleep(1200 + attempt * 800);
+            try {
+                await revealToolbar(scope);
+                const again = findDownloadControl(scope) || ctrl;
+                if (again && !again.disabled && again.getAttribute('aria-disabled') !== 'true') {
+                    again.click();
+                    log('  ↳ 已退回页面原生下载（文件名由 Google 生成）', 'warn');
+                    return { name: '（页面原生下载，文件名由 Google 生成）', from: '按钮' };
+                }
+            } catch (e) { }
+        }
+        log('  ⚠️ 下载按钮始终不可点，请手动点一次 Download full size', 'warn');
+        return { name: '（未下载：按钮不可点）', from: '按钮' };
     }
 
     /** 队列跑完自动导出清单和对照页 */
