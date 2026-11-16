@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.0.2
+// @version      1.0.3
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.0.2';
+    const VER = '1.0.3';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -220,10 +220,15 @@
         } catch (e) { /* 落到下面的兜底 */ }
 
         try {
+            // 同样不能用 innerHTML（Trusted Types），改为逐个节点构建
             el.focus();
-            el.innerHTML = String(text).split(/\r?\n/).map((line) =>
-                '<p>' + (line ? line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : '<br>') + '</p>'
-            ).join('');
+            el.textContent = '';
+            String(text).split(/\r?\n/).forEach((line) => {
+                const p = document.createElement('p');
+                if (line) p.textContent = line;
+                else p.appendChild(document.createElement('br'));
+                el.appendChild(p);
+            });
             el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
             return (el.innerText || '').trim().length > 0;
@@ -665,6 +670,39 @@
     <div class="pill" id="pill"><span class="dot" id="dot2"></span><span id="pillText">0/0</span></div>
     `;
 
+    /**
+     * Gemini 启用了 Trusted Types（CSP: require-trusted-types-for 'script'），
+     * 任何 innerHTML = 字符串 都会被浏览器拦截并抛出 TrustedHTML 错误。
+     * DOMParser 不在 Trusted Types 的注入点清单里，解析完再 importNode 导入即可绕过。
+     */
+    function parseHTMLFragment(html) {
+        try {
+            const doc = new DOMParser().parseFromString('<!doctype html><body>' + html, 'text/html');
+            if (!doc || !doc.body) throw new Error('解析结果为空');
+            const frag = document.createDocumentFragment();
+            Array.from(doc.body.childNodes).forEach((n) => {
+                frag.appendChild(document.importNode(n, true));
+            });
+            return frag;
+        } catch (e) {
+            console.error('[GIB] HTML 解析失败：', e);
+            return null;
+        }
+    }
+
+    function buildMinimalPanel() {
+        const wrap = document.createElement('div');
+        wrap.id = 'panel';
+        wrap.style.cssText =
+            'position:fixed;right:18px;bottom:18px;width:300px;background:#1b1b1f;color:#e9e9ec;' +
+            'padding:14px;border-radius:12px;border:1px solid #35353d;z-index:2147483600;' +
+            'font:12px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;';
+        const t = document.createElement('div');
+        t.textContent = '面板渲染降级：请把这段提示反馈给作者';
+        wrap.appendChild(t);
+        return wrap;
+    }
+
     function buildPanel() {
         const old = document.getElementById('gib-host');
         if (old) old.remove();
@@ -679,11 +717,31 @@
         } catch (e) {
             root = host; // 极少数环境不支持 shadow DOM，退化为普通节点
         }
-        root.innerHTML = '<style>' + PANEL_CSS + '</style>' + PANEL_HTML;
+
+        // 样式用 textContent 写入，不经过 innerHTML
+        const styleEl = document.createElement('style');
+        styleEl.textContent = PANEL_CSS;
+        root.appendChild(styleEl);
+
+        const frag = parseHTMLFragment(PANEL_HTML);
+        if (frag) {
+            root.appendChild(frag);
+        } else {
+            root.appendChild(buildMinimalPanel());
+        }
 
         // 兜底：关键定位用内联样式写死，即使 <style> 未生效面板也不会消失
         const pEl = root.getElementById('panel');
-        if (pEl) {
+        if (!pEl) {
+            // 解析出的结构不完整，整块换成最简面板，至少让用户看到提示
+            while (root.firstChild) root.removeChild(root.firstChild);
+            const s2 = document.createElement('style');
+            s2.textContent = PANEL_CSS;
+            root.appendChild(s2);
+            root.appendChild(buildMinimalPanel());
+            return;
+        }
+        {
             pEl.style.cssText =
                 'position:fixed;right:18px;bottom:18px;width:340px;display:block;' +
                 'z-index:2147483600;background:#1b1b1f;color:#e9e9ec;' +
