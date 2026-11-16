@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.6.0
+// @version      1.6.1
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.6.0';
+    const VER = '1.6.1';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -554,7 +554,7 @@
         const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
         const cap = {
             blob: null, href: null, name: '', urls: [], rpc: [], found: [], rpcCalls: [],
-            renamed: false, renameFailed: false, newWindow: false
+            renamed: false, renameFailed: false, newWindow: false, swallowed: false
         };
         const undo = [];
 
@@ -599,7 +599,10 @@
                                     this.download = wantName;
                                     cap.renamed = true;
                                 } else {
+                                    // 跨域：放行也改不了名，拦下来我们自己按名保存同一份
                                     cap.renameFailed = true;
+                                    cap.swallowed = true;
+                                    return;
                                 }
                             }
                         }
@@ -672,7 +675,12 @@
         try {
             try { trigger(); } catch (e) { }
             const t0 = Date.now();
-            while (!cap.blob && !cap.href && cap.rpc.length === 0 && Date.now() - t0 < 5000) await sleep(300);
+            // 下载是点击后异步触发的，实测要 10 秒左右，窗口必须够长
+            while (Date.now() - t0 < 25000) {
+                if (cap.renamed || cap.href) break;
+                await sleep(300);
+            }
+            if (!cap.renamed && !cap.href) log('  等了 25 秒仍未捕捉到下载动作', 'warn');
             await sleep(500);
         } finally {
             restorePendingHooks();
@@ -898,7 +906,28 @@
             }
         }
 
+        // 全都没成：至少让浏览器自己下一次，别让这一轮空着
+        if (cap.swallowed) {
+            try {
+                await sleep(500);
+                await revealToolbar(scope);
+                const again = findDownloadControl(scope) || ctrl;
+                if (again) again.click();
+                log('  ↳ 已退回原生下载，文件名归 Google', 'warn');
+            } catch (e) { }
+        }
         return { name: '（浏览器下载，文件名由 Google 生成）', from: '浏览器下载', meta: '' };
+    }
+
+    /** 队列跑完自动导出清单、对照页、日志 */
+    function autoExportIfNeeded() {
+        if (!S.autoExport || S.exported) return;
+        if (!recordKeys().length) return;
+        S.exported = true;
+        save();
+        exportAs('csv');
+        setTimeout(() => exportAs('html'), 1000);
+        setTimeout(() => exportAs('log'), 2000);
     }
 
     async function downloadAll(images, idx, prompt) {
