@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.0.8
+// @version      1.0.9
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.0.8';
+    const VER = '1.0.9';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -458,60 +458,106 @@
      */
     async function captureDownload(trigger) {
         const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-        const cap = { blob: null, href: null, name: '' };
-        const saved = { create: null, click: null, open: null };
+        const cap = { blob: null, href: null, name: '', urls: [] };
+        const undo = [];
 
+        const pushUrl = (tag, u) => {
+            try {
+                const s = String(u || '');
+                if (!s || s.length > 600) return;
+                if (/^(data:|about:|chrome|blob:)/.test(s)) return;
+                if (cap.urls.length < 12) cap.urls.push(tag + ' ' + s);
+            } catch (e) { }
+        };
+
+        // 出口一：createObjectURL 生成的图片 blob
         try {
-            saved.create = uw.URL.createObjectURL;
+            const orig = uw.URL.createObjectURL;
+            undo.push(() => { uw.URL.createObjectURL = orig; });
             uw.URL.createObjectURL = function (b) {
                 try {
                     if (b && /^image\//i.test(b.type) && b.size > 4096) {
                         if (!cap.blob || b.size > cap.blob.size) cap.blob = b;
                     }
                 } catch (e) { }
-                return saved.create.apply(this, arguments);
+                return orig.apply(this, arguments);
             };
         } catch (e) { }
 
+        // 出口二：<a download> 点出来的
         try {
             const proto = uw.HTMLAnchorElement && uw.HTMLAnchorElement.prototype;
             if (proto) {
-                saved.click = proto.click;
+                const orig = proto.click;
+                undo.push(() => { proto.click = orig; });
                 proto.click = function () {
                     try {
                         const h = this.href || '';
                         if (!cap.href && (/^blob:/.test(h) || /googleusercontent|^https?:.*\.(jpg|jpeg|png|webp)/i.test(h))) {
                             cap.href = h;
                             cap.name = this.download || '';
-                            return; // 拦下，稍后自己保存
+                            return;
                         }
                     } catch (e) { }
-                    return saved.click.apply(this, arguments);
+                    return orig.apply(this, arguments);
+                };
+            }
+        } catch (e) { }
+
+        // 出口三：window.open
+        try {
+            const orig = uw.open;
+            undo.push(() => { uw.open = orig; });
+            uw.open = function (url) {
+                try {
+                    const u = String(url || '');
+                    if (/^blob:|googleusercontent/.test(u)) { if (!cap.href) cap.href = u; pushUrl('open', u); return null; }
+                } catch (e) { }
+                return orig.apply(this, arguments);
+            };
+        } catch (e) { }
+
+        // 出口四：普通 fetch / XHR / 表单提交，只记录不拦截
+        try {
+            const orig = uw.fetch;
+            undo.push(() => { uw.fetch = orig; });
+            uw.fetch = function (input) {
+                try { pushUrl('fetch', typeof input === 'string' ? input : (input && input.url)); } catch (e) { }
+                return orig.apply(this, arguments);
+            };
+        } catch (e) { }
+
+        try {
+            const xp = uw.XMLHttpRequest && uw.XMLHttpRequest.prototype;
+            if (xp) {
+                const orig = xp.open;
+                undo.push(() => { xp.open = orig; });
+                xp.open = function (m, u) {
+                    try { pushUrl('xhr', u); } catch (e) { }
+                    return orig.apply(this, arguments);
                 };
             }
         } catch (e) { }
 
         try {
-            saved.open = uw.open;
-            uw.open = function (url) {
-                try {
-                    const u = String(url || '');
-                    if (/^blob:|googleusercontent/.test(u)) { if (!cap.href) cap.href = u; return null; }
-                } catch (e) { }
-                return saved.open.apply(this, arguments);
-            };
+            const fp = uw.HTMLFormElement && uw.HTMLFormElement.prototype;
+            if (fp) {
+                const orig = fp.submit;
+                undo.push(() => { fp.submit = orig; });
+                fp.submit = function () {
+                    try { pushUrl('form', this.action); } catch (e) { }
+                    return orig.apply(this, arguments);
+                };
+            }
         } catch (e) { }
 
         try { trigger(); } catch (e) { }
 
         const t0 = Date.now();
-        while (!cap.blob && !cap.href && Date.now() - t0 < 3500) await sleep(250);
+        while (!cap.blob && !cap.href && cap.urls.length === 0 && Date.now() - t0 < 3500) await sleep(250);
+        await sleep(300);
 
-        try {
-            if (saved.create) uw.URL.createObjectURL = saved.create;
-            if (saved.click && uw.HTMLAnchorElement) uw.HTMLAnchorElement.prototype.click = saved.click;
-            if (saved.open) uw.open = saved.open;
-        } catch (e) { }
+        undo.reverse().forEach((fn) => { try { fn(); } catch (e) { } });
 
         return cap;
     }
@@ -522,6 +568,12 @@
         const src = img.src;
         const scope = imageScope(img);
         let fallback = null;
+
+        // 先看清页面这张图本身是什么规格，判断它是不是已经是原图
+        try {
+            const b0 = await fetchBlob(src);
+            log(`  页面图规格：${/webp/i.test(b0.type) ? 'webp' : b0.type.replace('image/', '')} ${await blobMeta(b0)}`);
+        } catch (e) { }
 
         // 1) 直接把预览地址换成原图地址
         const full = toFullSizeUrl(src);
@@ -545,6 +597,18 @@
             let blob = cap.blob;
             if (!blob && cap.href) {
                 try { blob = await fetchBlob(cap.href); } catch (e) { }
+            }
+            if (!blob && cap.urls.length) {
+                log('  点击触发：' + cap.urls.slice(0, 3).join(' ｜ ').slice(0, 320));
+                const cand = cap.urls
+                    .map((s) => s.replace(/^\w+ /, ''))
+                    .find((u) => /^https?:/.test(u) && /gg-dl|download|googleusercontent|\.jpe?g|\.png/i.test(u));
+                if (cand) {
+                    try {
+                        const b2 = await fetchBlob(cand);
+                        if (/^image\//i.test(b2.type)) blob = b2;
+                    } catch (e) { }
+                }
             }
             if (blob) {
                 const out = GOOD_TYPES.test(blob.type) ? blob : await toPng(blob);
