@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.9.0
+// @version      1.9.1
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.9.0';
+    const VER = '1.9.1';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -587,7 +587,7 @@
         const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
         const cap = {
             blob: null, href: null, name: '', urls: [], rpc: [], found: [], rpcCalls: [],
-            renamed: false, renameFailed: false, newWindow: false, frameSrc: '', swallowed: false
+            renamed: false, renameFailed: false, newWindow: false, frameSrc: '', swallowed: false, rpcSeen: 0, rpcLen: 0
         };
         const undo = [];
 
@@ -686,14 +686,26 @@
             };
         } catch (e) { }
 
-        // 出口四：fetch —— 只记录，不拦截（页面照常下载）
+        // 出口四：fetch —— 只观测下载 RPC 的次数与响应长度，不拦截
         try {
             const orig = uw.fetch;
             undo.push(() => { uw.fetch = orig; });
             uw.fetch = function (input, init) {
                 const url = typeof input === 'string' ? input : (input && input.url) || '';
                 try { pushUrl('fetch', url); } catch (e) { }
-                return orig.apply(this, arguments);
+
+                const p = orig.apply(this, arguments);
+                try {
+                    if (/rpcids=c8o8Fe/.test(url) && p && typeof p.then === 'function') {
+                        cap.rpcSeen++;
+                        p.then((res) => {
+                            try {
+                                res.clone().text().then((t) => { cap.rpcLen = t.length; }).catch(() => { });
+                            } catch (e) { }
+                        }).catch(() => { });
+                    }
+                } catch (e) { }
+                return p;
             };
         } catch (e) { }
 
@@ -926,29 +938,40 @@
             return m ? m.length : 0;
         };
 
-        let clicked = false;
+        let ctrl = null;
         for (let attempt = 1; attempt <= 6; attempt++) {
             const btn = await waitDownloadReady(scope, 15000);
-            if (!btn) { log('  ⚠️ 下载按钮始终不可点', 'warn'); break; }
+            if (btn) ctrl = btn;
+            if (!btn) { log('  ⚠️ 下载按钮始终不可点，放弃本轮', 'warn'); break; }
 
+            const btnDesc = btn.disabled ? 'disabled' : (btn.getAttribute('aria-disabled') === 'true' ? 'aria-disabled' : '可点');
             const before = countErr();
+            const t0 = Date.now();
+            log(`  点击 #${attempt} → 按钮${btnDesc}，观察 3 秒 …`);
+
             const cap = await captureDownload(() => btn.click(), baseName, 3000);
-            clicked = true;
+            await sleep(2000);
+
+            const cost = ((Date.now() - t0) / 1000).toFixed(1);
+            const delta = countErr() - before;
+            const carrier = cap.renamed ? '已改名' : (cap.href ? '锚点' : (cap.frameSrc ? 'iframe' : (cap.blob ? 'blob' : '无')));
+            const rpc = cap.rpcSeen ? (cap.rpcSeen + ' 次' + (cap.rpcLen ? '/' + cap.rpcLen + 'B' : '')) : '无';
+            const verdict = cap.renamed ? '已按自定义名下载' : (delta > 0 ? '未触发 · 页面报错' : '已触发下载');
+            log(`    RPC ${rpc} · 报错+${delta} · 载体 ${carrier} · 用时 ${cost}s → ${verdict}`);
 
             if (cap.renamed) {
                 log('  ✓ 已改名为 ' + baseName + '，由浏览器下载');
                 return { name: baseName, from: '浏览器下载', meta: '' };
             }
 
-            await sleep(2000);
-            if (countErr() > before) {
-                log(`  第 ${attempt} 次点击后页面提示无法下载，等 5 秒重试`, 'warn');
+            if (delta > 0) {
+                log(`    ↳ 第 ${attempt} 次无效，等 5 秒重试`, 'warn');
                 await sleep(5000);
                 continue;
             }
-            log('  ✓ 已触发浏览器下载（第 ' + attempt + ' 次点击）');
             return { name: '（浏览器下载，文件名由 Google 生成）', from: '浏览器下载', meta: '' };
         }
+        log('  ⚠️ 6 次点击均未触发下载', 'warn');
 
         // 兜底：让浏览器自己下一次，保证这一轮不空手
         try {
