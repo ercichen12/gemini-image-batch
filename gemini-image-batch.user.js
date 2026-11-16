@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.3.1
+// @version      1.3.2
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.3.1';
+    const VER = '1.3.2';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -556,42 +556,40 @@
                 const url = typeof input === 'string' ? input : (input && input.url) || '';
                 try { pushUrl('fetch', url); } catch (e) { }
 
-                // 记下 batchexecute 的请求体，稍后自己重放
-                try {
-                    if (/batchexecute/.test(url) && cap.rpcCalls.length < 3) {
-                        let body = (init && init.body);
-                        if (!body && input && typeof input !== 'string' && typeof input.body === 'string') body = input.body;
-                        if (typeof body === 'string' && body.length > 8) {
-                            cap.rpcCalls.push({ url, body });
-                        }
-                    }
-                } catch (e) { }
+                const isDownloadRpc = /rpcids=c8o8Fe/.test(url);
+                const bodyStr = /batchexecute/.test(url) ? readBodySync(init && init.body) : null;
 
-                // 下载专用的 RPC（rpcids=c8o8Fe）：拦下不让页面自己下，
-                // 我们重放拿原图，这样只留一份、且名字归我们
-                try {
-                    if (/rpcids=c8o8Fe/.test(url)) {
-                        cap.suppressed = true;
-                        return Promise.resolve(new Response(")]}'\n\n[]", {
-                            status: 200,
-                            headers: { 'content-type': 'application/json' }
-                        }));
+                if (isDownloadRpc) {
+                    // 同步就能拿到请求体：抑制页面下载，我们重放
+                    if (bodyStr) {
+                        if (cap.rpcCalls.length < 3) cap.rpcCalls.push({ url: url, body: bodyStr });
+                        try {
+                            cap.suppressed = true;
+                            return Promise.resolve(fakeRpcResponse());
+                        } catch (e) { }
                     }
-                } catch (e) { }
 
-                const p = orig.apply(this, arguments);
-                try {
-                    if (/batchexecute/.test(url) && p && typeof p.then === 'function') {
-                        p.then((res) => {
-                            try {
-                                res.clone().text().then((t) => {
-                                    if (cap.rpc.length < 4) cap.rpc.push(t.slice(0, 30000));
-                                }).catch(() => { });
-                            } catch (e) { }
-                        }).catch(() => { });
+                    // Request 对象：克隆后异步读，读到了才抑制
+                    if (input && typeof input !== 'string' && input.clone) {
+                        try {
+                            return input.clone().text().then(function (t) {
+                                if (t && t.length > 8 && cap.rpcCalls.length < 3) cap.rpcCalls.push({ url: url, body: t });
+                                if (t && t.length > 8) {
+                                    cap.suppressed = true;
+                                    return fakeRpcResponse();
+                                }
+                                return orig.call(uw, input, init);
+                            }).catch(function () {
+                                return orig.call(uw, input, init);
+                            });
+                        } catch (e) { }
                     }
-                } catch (e) { }
-                return p;
+
+                    // 实在拿不到请求体：不抑制，让页面自己下载（保图优先）
+                    cap.unsuppressed = true;
+                }
+
+                return orig.apply(this, arguments);
             };
         } catch (e) { }
 
@@ -663,6 +661,32 @@
         const bm = s.match(/(\/9j\/[A-Za-z0-9+/=]{4000,}|iVBORw0KGgo[A-Za-z0-9+/=]{4000,})/);
         if (bm) out.b64 = bm[1];
         return out;
+    }
+
+    /** 把各种形态的请求体统一成字符串；读不出来返回 null */
+    function readBodySync(body) {
+        if (!body) return null;
+        try {
+            if (typeof body === 'string') return body.length > 8 ? body : null;
+            if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+                const s = body.toString();
+                return s.length > 8 ? s : null;
+            }
+            if (typeof FormData !== 'undefined' && body instanceof FormData) {
+                const parts = [];
+                body.forEach((v, k) => { parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(v)); });
+                const s = parts.join('&');
+                return s.length > 8 ? s : null;
+            }
+        } catch (e) { }
+        return null;
+    }
+
+    function fakeRpcResponse() {
+        return new Response(")]}'\n\n[]", {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+        });
     }
 
     /** 用同样的地址和请求体再发一次，拿干净的响应 */
@@ -772,9 +796,24 @@
                 triggerDownload(out, name);
                 return { name, from: '原图', meta: await blobMeta(out) };
             }
-            // 没截到（可能是别的下载方式），退回原生点击，至少把图拿到
-            await sleep(200);
-            try { ctrl.click(); } catch (e) { }
+            if (!blob && cap.rpcCalls.length === 0) {
+                log('  ⚠️ 未取到下载请求体（可能是 Request 对象或二进制体）', 'warn');
+            }
+            if (cap.suppressed) log('  已接管下载接口，但没从中解析出图片', 'warn');
+            if (cap.unsuppressed) log('  ↳ 未接管，已放行页面自行下载', 'warn');
+
+            // 没截到：退回原生点击，至少把图拿到（保图优先）
+            await sleep(400);
+            try {
+                await revealToolbar(scope);
+                const again = findDownloadControl(scope) || ctrl;
+                if (again && !again.disabled && again.getAttribute('aria-disabled') !== 'true') {
+                    again.click();
+                    log('  ↳ 已退回页面原生下载（文件名由 Google 生成）', 'warn');
+                } else {
+                    log('  ⚠️ 下载按钮当前不可点，请手动点一次 Download full size', 'warn');
+                }
+            } catch (e) { }
             return { name: '（页面原生下载，文件名由 Google 生成）', from: '按钮' };
         }
 
@@ -882,7 +921,7 @@
             const imgs = (r.files || []).map((f) => '<img src="' + esc(f) + '" alt="">').join('');
             return '<article class="card' + (ok ? '' : ' bad') + '">' +
                 '<div class="hd"><b>' + String(k + 1).padStart(3, '0') + '</b><span>' + esc(r.state || '') + '</span></div>' +
-                (imgs ? '<div class="im">' + imgs + '</div>' : '<div class="im empty">无本地文件</div>') +
+                (imgs ? '<div class="im">' + imgs + '</div>' : '<div class="im empty">未保存到本地 · 可用下方链接回原对话取图</div>') +
                 '<p class="p">' + esc(r.prompt || '') + '</p>' +
                 '<div class="mt">' + esc(r.meta || '') +
                 (r.session ? ' · <a href="' + esc(r.session) + '" target="_blank" rel="noreferrer">回到对话</a>' : '') +
