@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.0.6
+// @version      1.0.7
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.0.6';
+    const VER = '1.0.7';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -829,7 +829,10 @@
         const details = h('details', null,
             h('summary', { text: '设置与自检' }),
             cfg,
-            h('div', { class: 'row' }, h('button', { class: 'btn', id: 'btnProbe', text: '自检当前页面' }))
+            h('div', { class: 'row' },
+                h('button', { class: 'btn', id: 'btnProbe', text: '自检当前页面' }),
+                h('button', { class: 'btn', id: 'btnCopyLog', text: '复制日志' })
+            )
         );
 
         const body = h('div', { class: 'body' },
@@ -891,7 +894,8 @@
             btnStart: $('btnStart'), btnSkip: $('btnSkip'), btnReset: $('btnReset'),
             pillText: $('pillText'), head: $('head'), btnMin: $('btnMin'), btnHide: $('btnHide'),
             cfgDelay: $('cfgDelay'), cfgTimeout: $('cfgTimeout'),
-            cfgNewChat: $('cfgNewChat'), cfgAutoDl: $('cfgAutoDl'), btnProbe: $('btnProbe')
+            cfgNewChat: $('cfgNewChat'), cfgAutoDl: $('cfgAutoDl'), btnProbe: $('btnProbe'),
+            btnCopyLog: $('btnCopyLog')
         };
 
         ui.ta.value = S.raw;
@@ -943,6 +947,7 @@
         ui.cfgNewChat.addEventListener('change', () => { S.newChat = ui.cfgNewChat.checked; save(); });
         ui.cfgAutoDl.addEventListener('change', () => { S.autoDownload = ui.cfgAutoDl.checked; save(); });
         ui.btnProbe.addEventListener('click', probe);
+        ui.btnCopyLog.addEventListener('click', copyLog);
 
         // 收起 / 隐藏 / 拖动
         ui.btnMin.addEventListener('click', () => { S.minimized = true; save(); render(); });
@@ -989,6 +994,28 @@
         ui.log.appendChild(div);
         ui.log.scrollTop = ui.log.scrollHeight;
         while (ui.log.childElementCount > 200) ui.log.firstElementChild.remove();
+    }
+
+    async function copyLog() {
+        const text = ui.log ? ui.log.innerText : '';
+        if (!text.trim()) { log('⚠️ 日志为空', 'warn'); return; }
+        try {
+            await navigator.clipboard.writeText(text);
+            log('📋 日志已复制到剪贴板，可直接粘贴');
+        } catch (e) {
+            try {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.cssText = 'position:fixed;left:-9999px;';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                ta.remove();
+                log('📋 日志已复制到剪贴板，可直接粘贴');
+            } catch (e2) {
+                log('✗ 复制失败，请在日志区手动选中后 Ctrl+C', 'err');
+            }
+        }
     }
 
     function render() {
