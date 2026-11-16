@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.7.2
+// @version      1.8.0
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.7.2';
+    const VER = '1.8.0';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -587,7 +587,7 @@
         const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
         const cap = {
             blob: null, href: null, name: '', urls: [], rpc: [], found: [], rpcCalls: [],
-            renamed: false, renameFailed: false, newWindow: false, swallowed: false
+            renamed: false, renameFailed: false, newWindow: false, frameSrc: '', swallowed: false
         };
         const undo = [];
 
@@ -599,6 +599,29 @@
                 if (cap.urls.length < 12) cap.urls.push(tag + ' ' + s);
             } catch (e) { }
         };
+
+        // 出口零：下载载体通常是一个临时 iframe 或锚点，用变更监听兜住
+        try {
+            const mo = new MutationObserver((muts) => {
+                muts.forEach((m) => {
+                    if (!m.addedNodes) return;
+                    Array.prototype.forEach.call(m.addedNodes, (n) => {
+                        try {
+                            const tag = (n.tagName || '').toUpperCase();
+                            if (tag === 'IFRAME' && n.src) {
+                                cap.frameSrc = n.src;
+                                pushUrl('iframe', n.src);
+                            } else if (tag === 'A' && n.href) {
+                                if (!cap.href) cap.href = n.href;
+                                pushUrl('a-new', n.href);
+                            }
+                        } catch (e) { }
+                    });
+                });
+            });
+            mo.observe(document.documentElement, { childList: true, subtree: true });
+            undo.push(() => { try { mo.disconnect(); } catch (e) { } });
+        } catch (e) { }
 
         // 出口一：createObjectURL 生成的图片 blob
         try {
@@ -726,10 +749,10 @@
             // 实测点击后约 35 秒才真正下载；一旦某轮抓不到就缩短后续等待
             const waitMs = S.capFail ? 12000 : 60000;
             while (Date.now() - t0 < waitMs) {
-                if (cap.renamed || cap.href || cap.rpcText) break;
+                if (cap.renamed || cap.href || cap.frameSrc || cap.rpcText) break;
                 await sleep(300);
             }
-            if (cap.renamed || cap.href || cap.rpcText) {
+            if (cap.renamed || cap.href || cap.frameSrc || cap.rpcText) {
                 log(`  点击后 ${Math.round((Date.now() - t0) / 1000)} 秒捕捉到下载动作`);
             } else {
                 log('  等了 ' + Math.round(waitMs / 1000) + ' 秒仍未捕捉到下载动作', 'warn');
@@ -926,6 +949,22 @@
         if (cap.renamed) {
             log('  ✓ 已改名为 ' + baseName + '，由浏览器下载');
             return { name: baseName, from: '浏览器下载', meta: '' };
+        }
+
+        // 优先用页面真实使用的下载载体地址（iframe / 新建锚点）
+        if (cap.frameSrc) {
+            log('  捕获下载载体地址：' + cap.frameSrc.slice(0, 90));
+            if (typeof GM_download === 'function') {
+                try {
+                    await new Promise((res, rej) => {
+                        GM_download({ url: cap.frameSrc, name: baseName + '.jpg', saveAs: false, onload: res, onerror: rej });
+                    });
+                    log('  ✓ 已由扩展保存为 ' + baseName + '.jpg');
+                    return { name: baseName + '.jpg', from: '扩展下载', meta: '' };
+                } catch (e) {
+                    log('  ✗ 载体地址下载失败：' + (e && e.message ? e.message : e), 'err');
+                }
+            }
         }
 
         // 用页面那次下载响应的真实地址取图（不是重放，字节应与浏览器一致）
