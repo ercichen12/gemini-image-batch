@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.6.1
+// @version      1.6.2
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.6.1';
+    const VER = '1.6.2';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -37,6 +37,7 @@
         records: {},        // index -> { prompt, state, files, meta, session, at, reason, nativeCount }
         autoExport: true,
         exported: false,
+        capFail: false,
         sentAt: {},         // index -> 时间戳，防止刷新后重复发送
         running: false,
         paused: false,
@@ -675,12 +676,17 @@
         try {
             try { trigger(); } catch (e) { }
             const t0 = Date.now();
-            // 下载是点击后异步触发的，实测要 10 秒左右，窗口必须够长
-            while (Date.now() - t0 < 25000) {
+            // 实测点击后约 35 秒才真正下载；一旦某轮抓不到就缩短后续等待
+            const waitMs = S.capFail ? 12000 : 60000;
+            while (Date.now() - t0 < waitMs) {
                 if (cap.renamed || cap.href) break;
                 await sleep(300);
             }
-            if (!cap.renamed && !cap.href) log('  等了 25 秒仍未捕捉到下载动作', 'warn');
+            if (cap.renamed || cap.href) {
+                log(`  点击后 ${Math.round((Date.now() - t0) / 1000)} 秒捕捉到下载动作`);
+            } else {
+                log('  等了 ' + Math.round(waitMs / 1000) + ' 秒仍未捕捉到下载动作', 'warn');
+            }
             await sleep(500);
         } finally {
             restorePendingHooks();
@@ -871,6 +877,7 @@
         if (!ctrl) throw new Error('找不到下载按钮');
 
         const cap = await captureDownload(() => ctrl.click(), baseName);
+        if (!cap.renamed && !cap.href) { S.capFail = true; save(); }
 
         if (cap.renamed) {
             log('  ✓ 已改名为 ' + baseName + '，由浏览器下载');
@@ -1124,6 +1131,10 @@
             }
 
             log(`  出图 ${result.images.length} 张`);
+            if (S.autoDownload) {
+                log('  等 6 秒让页面就绪再下载 …');
+                await sleep(6000);
+            }
             let saved = [];
             if (S.autoDownload) saved = await downloadAll(result.images, idx, prompt);
 
@@ -1476,7 +1487,7 @@
         });
         ui.btnReset.addEventListener('click', () => {
             if (!confirm('清空队列与所有进度？')) return;
-            S = Object.assign({}, DEFAULTS, { raw: '', cursor: 0, statuses: [], sentAt: {}, records: {}, queue: [], exported: false });
+            S = Object.assign({}, DEFAULTS, { raw: '', cursor: 0, statuses: [], sentAt: {}, records: {}, queue: [], exported: false, capFail: false });
             ui.ta.value = '';
             save(); render();
             log('已清空');
@@ -1632,6 +1643,7 @@
 
         S.running = true;
         S.paused = false;
+        S.capFail = false;   // 每批重新给满窗口
         save(); render();
         log(`▶ 启动，共 ${S.queue.length} 条`);
 
