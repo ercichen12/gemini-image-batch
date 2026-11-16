@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.0.4
+// @version      1.0.5
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.0.4';
+    const VER = '1.0.5';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -368,30 +368,142 @@
         setTimeout(() => URL.revokeObjectURL(url), 15000);
     }
 
-    async function saveOneImage(src, baseName) {
-        // 1) 取 blob 自己命名保存（blob: 链接最稳）
+    /** 页面上的预览图带 =s1024-rw 这类尺寸参数，改成 =s0 通常就是原图 */
+    function toFullSizeUrl(src) {
+        if (!src) return src;
+        if (/=s\d+(-rw|-no)?$/.test(src)) return src.replace(/=s\d+(-rw|-no)?$/, '=s0');
+        if (/=w\d+-h\d+(-rw|-no)?$/.test(src)) return src.replace(/=w\d+-h\d+(-rw|-no)?$/, '=s0');
+        return src;
+    }
+
+    async function fetchBlob(url) {
+        const res = await fetch(url, { credentials: 'include' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const blob = await res.blob();
+        if (blob.size < 2048) throw new Error('响应过小');
+        return blob;
+    }
+
+    const GOOD_TYPES = /^image\/(png|jpeg|jpg)$/i;
+
+    /** 明确不要 webp，实在只有 webp 就转成 png */
+    async function toPng(blob) {
         try {
-            const res = await fetch(src, { credentials: 'include' });
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            const blob = await res.blob();
-            if (blob.size < 1024) throw new Error('响应过小');
-            const name = baseName + '.' + mimeToExt(blob.type);
-            triggerDownload(blob, name);
-            return name;
-        } catch (e1) {
-            // 2) 交给 Tampermonkey 扩展下载（可绕开跨域）
+            const bmp = await createImageBitmap(blob);
+            const cv = document.createElement('canvas');
+            cv.width = bmp.width;
+            cv.height = bmp.height;
+            cv.getContext('2d').drawImage(bmp, 0, 0);
+            const png = await new Promise((r) => cv.toBlob(r, 'image/png'));
+            if (png && png.size > 2048) return png;
+        } catch (e) { }
+        return blob;
+    }
+
+    /** 找到只包含这一张图的最近容器，避免拿错另一张图的下载按钮 */
+    function imageScope(img) {
+        let node = img.parentElement;
+        let best = node;
+        for (let i = 0; i < 6 && node; i++) {
+            const bigs = Array.from(node.querySelectorAll('img')).filter((x) => x.naturalWidth >= 256);
+            best = node;
+            if (bigs.length <= 1) break;
+            node = node.parentElement;
+        }
+        return best || img.parentElement;
+    }
+
+    function findDownloadControl(scope) {
+        const labels = ['download full size', 'download fullsize', 'download original',
+            'download image', '下载原图', '下载完整尺寸', '下载图片', '保存原图'];
+        const find = (root) => {
+            if (!root) return null;
+            for (const el of root.querySelectorAll('button, a, [role="button"]')) {
+                const txt = ((el.getAttribute('aria-label') || '') + ' ' +
+                    (el.getAttribute('title') || '') + ' ' +
+                    (el.textContent || '')).toLowerCase();
+                if (labels.some((t) => txt.includes(t))) return el;
+            }
+            return null;
+        };
+        return find(scope) || find(document.body);
+    }
+
+    async function revealToolbar(scope) {
+        const types = ['pointerenter', 'pointerover', 'mouseenter', 'mouseover', 'mousemove'];
+        const targets = [scope].concat(Array.from(scope.querySelectorAll('img')).slice(0, 2));
+        targets.forEach((n) => {
+            types.forEach((t) => {
+                try { n.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })); } catch (e) { }
+            });
+        });
+        await sleep(500);
+    }
+
+    /** 保存单张：优先原图，绝不落 webp */
+    async function saveOneImage(img, baseName) {
+        if (!img || !img.src) throw new Error('图片元素无效');
+        const src = img.src;
+        const scope = imageScope(img);
+        let fallback = null;
+
+        // 1) 直接把预览地址换成原图地址
+        const full = toFullSizeUrl(src);
+        if (full !== src) {
+            try {
+                const blob = await fetchBlob(full);
+                if (GOOD_TYPES.test(blob.type)) {
+                    const name = baseName + '.' + mimeToExt(blob.type);
+                    triggerDownload(blob, name);
+                    return { name, from: '原图' };
+                }
+                fallback = blob; // 还是 webp，先留着备用
+            } catch (e) { }
+        }
+
+        // 2) 用页面自带的「Download full size」，让 Google 给原始文件
+        await revealToolbar(scope);
+        const ctrl = findDownloadControl(scope);
+        if (ctrl) {
+            const href = ctrl.tagName === 'A' ? ctrl.href : null;
+            if (href) {
+                try {
+                    const blob = await fetchBlob(href);
+                    const out = GOOD_TYPES.test(blob.type) ? blob : await toPng(blob);
+                    const name = baseName + '.' + mimeToExt(out.type);
+                    triggerDownload(out, name);
+                    return { name, from: '原图' };
+                } catch (e) { }
+            }
+            ctrl.click();
+            return { name: '（已由页面下载原图，文件名由 Google 生成）', from: '按钮' };
+        }
+
+        // 3) 兜底：webp 转 png
+        if (fallback) {
+            const png = await toPng(fallback);
+            const name = baseName + '.png';
+            triggerDownload(png, name);
+            return { name, from: 'webp转png' };
+        }
+
+        // 4) 最后才用预览图本身
+        try {
+            const blob = await fetchBlob(src);
+            const out = GOOD_TYPES.test(blob.type) ? blob : await toPng(blob);
+            const name = baseName + '.' + mimeToExt(out.type);
+            triggerDownload(out, name);
+            return { name, from: '预览图' };
+        } catch (e) {
             if (typeof GM_download === 'function') {
                 const name = baseName + '.png';
-                await new Promise((resolve, reject) => {
-                    try {
-                        GM_download({ url: src, name, saveAs: false, onload: resolve, onerror: reject });
-                    } catch (err) { reject(err); }
+                await new Promise((res, rej) => {
+                    try { GM_download({ url: full, name, saveAs: false, onload: res, onerror: rej }); }
+                    catch (err) { rej(err); }
                 });
-                return name;
+                return { name, from: 'GM_download' };
             }
-            // 3) 最后兜底：新窗口打开，用户自己另存
-            window.open(src, '_blank');
-            throw new Error('跨域受限，已在新标签打开原图');
+            throw new Error('取图失败');
         }
     }
 
@@ -401,10 +513,10 @@
         for (let i = 0; i < images.length; i++) {
             const suffix = images.length > 1 ? '_' + (i + 1) : '';
             try {
-                const name = await saveOneImage(images[i].src, base + suffix);
+                const r = await saveOneImage(images[i].el, base + suffix);
                 ok++;
-                log(`⬇ 已保存 ${name}`);
-                await sleep(400);
+                log(`⬇ 已保存 ${r.name}（${r.from}）`);
+                await sleep(r.from === '按钮' ? 900 : 400);
             } catch (e) {
                 log(`✗ 第 ${i + 1} 张保存失败：${e.message || e}`);
             }
