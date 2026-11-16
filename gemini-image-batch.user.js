@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.8.0
+// @version      1.8.1
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.8.0';
+    const VER = '1.8.1';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -686,35 +686,14 @@
             };
         } catch (e) { }
 
-        // 出口四：fetch —— 下载 RPC 由我们代办：读真响应，回假响应阻止页面自己导航下载
+        // 出口四：fetch —— 只记录，不拦截（页面照常下载）
         try {
             const orig = uw.fetch;
             undo.push(() => { uw.fetch = orig; });
             uw.fetch = function (input, init) {
                 const url = typeof input === 'string' ? input : (input && input.url) || '';
                 try { pushUrl('fetch', url); } catch (e) { }
-
-                if (!/rpcids=c8o8Fe/.test(url)) return orig.apply(this, arguments);
-
-                try {
-                    if (cap.rpcCalls.length < 3) {
-                        const b = readBodySync(init && init.body);
-                        if (b) cap.rpcCalls.push({ url: url, body: b });
-                    }
-                } catch (e) { }
-
-                let p;
-                try { p = orig.apply(this, arguments); } catch (e) { p = null; }
-                return Promise.resolve(p).then(function (res) {
-                    try {
-                        res.clone().text().then(function (t) { cap.rpcText = t; }).catch(function () { });
-                    } catch (e) { }
-                    cap.suppressed = true;
-                    return fakeRpcResponse();
-                }).catch(function () {
-                    cap.suppressed = true;
-                    return fakeRpcResponse();
-                });
+                return orig.apply(this, arguments);
             };
         } catch (e) { }
 
@@ -949,86 +928,6 @@
         if (cap.renamed) {
             log('  ✓ 已改名为 ' + baseName + '，由浏览器下载');
             return { name: baseName, from: '浏览器下载', meta: '' };
-        }
-
-        // 优先用页面真实使用的下载载体地址（iframe / 新建锚点）
-        if (cap.frameSrc) {
-            log('  捕获下载载体地址：' + cap.frameSrc.slice(0, 90));
-            if (typeof GM_download === 'function') {
-                try {
-                    await new Promise((res, rej) => {
-                        GM_download({ url: cap.frameSrc, name: baseName + '.jpg', saveAs: false, onload: res, onerror: rej });
-                    });
-                    log('  ✓ 已由扩展保存为 ' + baseName + '.jpg');
-                    return { name: baseName + '.jpg', from: '扩展下载', meta: '' };
-                } catch (e) {
-                    log('  ✗ 载体地址下载失败：' + (e && e.message ? e.message : e), 'err');
-                }
-            }
-        }
-
-        // 用页面那次下载响应的真实地址取图（不是重放，字节应与浏览器一致）
-        if (cap.rpcText) {
-            const cand = rpcCandidates(cap.rpcText);
-            log(`  页面下载响应：${cap.rpcText.length}B，地址 ${cand.urls.length} 个`);
-            // 优先：交给扩展按名下载同一地址（已验证可拿到原始文件）
-            if (cand.urls.length && typeof GM_download === 'function') {
-                log('  改用扩展下载该地址 …', 'warn');
-                try {
-                    await new Promise((res, rej) => {
-                        GM_download({ url: cand.urls[0], name: baseName + '.jpg', saveAs: false, onload: res, onerror: rej });
-                    });
-                    log('  ✓ 已由扩展保存为 ' + baseName + '.jpg');
-                    return { name: baseName + '.jpg', from: '扩展下载', meta: '' };
-                } catch (e) {
-                    log('  ✗ 扩展下载失败：' + (e && e.message ? e.message : e), 'err');
-                }
-            }
-
-            let best = null;
-            for (let i = 0; i < cand.urls.length; i++) {
-                const vs = sizeVariants(cand.urls[i]);
-                for (let k = 0; k < vs.length; k++) {
-                    try {
-                        const b = await fetchBlob(vs[k]);
-                        if (!/^image\//i.test(b.type)) continue;
-                        const d = await blobSize(b);
-                        log(`  候选 ${vs[k].slice(-8)}：${d.w}×${d.h} ${(b.size / 1048576).toFixed(2)}MB`);
-                        if (!best || b.size > best.b.size) best = { b: b, d: d };
-                    } catch (e) { log(`  取图失败 ${vs[k].slice(-8)}：${e.message || e}`, 'warn'); }
-                }
-            }
-            if (best) {
-                const name = baseName + '.' + mimeToExt(best.b.type);
-                triggerDownload(best.b, name);
-                log(`  ✓ 已保存 ${name}（${best.d.w}×${best.d.h} · ${(best.b.size / 1048576).toFixed(2)}MB）`);
-                return { name: name, from: '原图', meta: await blobMeta(best.b) };
-            }
-
-            // 取不到字节，但地址就是浏览器要导航去下载的那个：交给扩展按名下载
-            if (cand.urls.length && typeof GM_download === 'function') {
-                const u = cand.urls[0];
-                log('  改用扩展下载该地址 …', 'warn');
-                try {
-                    await new Promise((res, rej) => {
-                        GM_download({ url: u, name: baseName + '.jpg', saveAs: false, onload: res, onerror: rej });
-                    });
-                    log('  ✓ 已由扩展保存为 ' + baseName + '.jpg');
-                    return { name: baseName + '.jpg', from: '扩展下载', meta: '' };
-                } catch (e) {
-                    log('  ✗ 扩展下载失败：' + (e && e.message ? e.message : e), 'err');
-                }
-            }
-
-            // 最后：直接导航到该地址，至少让文件落到本地（名字归 Google）
-            if (cand.urls.length) {
-                try {
-                    log('  ↳ 改为直接打开下载地址 …', 'warn');
-                    location.href = cand.urls[0];   // 导航式下载，不会被弹窗拦截
-                    return { name: '（浏览器下载，文件名由 Google 生成）', from: '浏览器下载', meta: '' };
-                } catch (e) { }
-            }
-            log('  ⚠️ 从下载响应里没取到图片', 'warn');
         }
 
         // 兜底：让浏览器自己下一次，保证这一轮不空手
