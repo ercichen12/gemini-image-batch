@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.2.0
+// @version      1.3.0
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.2.0';
+    const VER = '1.3.0';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -475,7 +475,7 @@
      */
     async function captureDownload(trigger) {
         const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-        const cap = { blob: null, href: null, name: '', urls: [], rpc: [], found: [] };
+        const cap = { blob: null, href: null, name: '', urls: [], rpc: [], found: [], rpcCalls: [] };
         const undo = [];
 
         const pushUrl = (tag, u) => {
@@ -543,9 +543,33 @@
         try {
             const orig = uw.fetch;
             undo.push(() => { uw.fetch = orig; });
-            uw.fetch = function (input) {
+            uw.fetch = function (input, init) {
                 const url = typeof input === 'string' ? input : (input && input.url) || '';
                 try { pushUrl('fetch', url); } catch (e) { }
+
+                // 记下 batchexecute 的请求体，稍后自己重放
+                try {
+                    if (/batchexecute/.test(url) && cap.rpcCalls.length < 3) {
+                        let body = (init && init.body);
+                        if (!body && input && typeof input !== 'string' && typeof input.body === 'string') body = input.body;
+                        if (typeof body === 'string' && body.length > 8) {
+                            cap.rpcCalls.push({ url, body });
+                        }
+                    }
+                } catch (e) { }
+
+                // 下载专用的 RPC（rpcids=c8o8Fe）：拦下不让页面自己下，
+                // 我们重放拿原图，这样只留一份、且名字归我们
+                try {
+                    if (/rpcids=c8o8Fe/.test(url)) {
+                        cap.suppressed = true;
+                        return Promise.resolve(new Response(")]}'\n\n[]", {
+                            status: 200,
+                            headers: { 'content-type': 'application/json' }
+                        }));
+                    }
+                } catch (e) { }
+
                 const p = orig.apply(this, arguments);
                 try {
                     if (/batchexecute/.test(url) && p && typeof p.then === 'function') {
@@ -609,6 +633,50 @@
         return cap;
     }
 
+    function unescapeRpc(text) {
+        return String(text || '')
+            .replace(/\\u003d/gi, '=').replace(/\\u0026/gi, '&')
+            .replace(/\\u003f/gi, '?').replace(/\\u002f/gi, '/')
+            .replace(/\\\//g, '/').replace(/\\"/g, '"');
+    }
+
+    /** RPC 响应里可能的两种形态：图片地址，或直接内嵌的 base64 */
+    function rpcCandidates(text) {
+        const out = { urls: [], b64: null };
+        const s = unescapeRpc(text);
+        const urls = s.match(/https:\/\/[^\s"'<>\\]{16,}/g) || [];
+        urls.forEach((u) => {
+            if (!/googleusercontent|\/gg-dl\/|\.(jpe?g|png|webp)/i.test(u)) return;
+            if (out.urls.indexOf(u) === -1 && out.urls.length < 10) out.urls.push(u);
+        });
+        const bm = s.match(/(\/9j\/[A-Za-z0-9+/=]{4000,}|iVBORw0KGgo[A-Za-z0-9+/=]{4000,})/);
+        if (bm) out.b64 = bm[1];
+        return out;
+    }
+
+    /** 用同样的地址和请求体再发一次，拿干净的响应 */
+    async function replayRpc(call) {
+        const res = await fetch(call.url, {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+                'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                'x-same-domain': '1'
+            },
+            body: call.body
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return await res.text();
+    }
+
+    function b64ToBlob(b64) {
+        const bin = atob(b64);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        const type = arr[0] === 0xFF ? 'image/jpeg' : (arr[0] === 0x89 ? 'image/png' : 'image/jpeg');
+        return new Blob([arr], { type });
+    }
+
     /** 保存单张：优先原图，绝不落 webp */
     async function saveOneImage(img, baseName) {
         if (!img || !img.src) throw new Error('图片元素无效');
@@ -644,6 +712,27 @@
             let blob = cap.blob;
             if (!blob && cap.href) {
                 try { blob = await fetchBlob(cap.href); } catch (e) { }
+            }
+            if (!blob && cap.rpcCalls.length) {
+                for (let c = 0; c < cap.rpcCalls.length && !blob; c++) {
+                    try {
+                        const text = await replayRpc(cap.rpcCalls[c]);
+                        const cand = rpcCandidates(text);
+                        log(`  RPC 重放：${(text.length / 1024).toFixed(0)}KB，地址 ${cand.urls.length} 个${cand.b64 ? '，含内嵌图' : ''}`);
+                        for (let u = 0; u < cand.urls.length && !blob; u++) {
+                            try {
+                                const b = await fetchBlob(cand.urls[u]);
+                                if (/^image\//i.test(b.type) && b.size > 8192) blob = b;
+                            } catch (e) { }
+                        }
+                        if (!blob && cand.b64) {
+                            const bb = b64ToBlob(cand.b64);
+                            if (bb.size > 8192) blob = await sniffImage(bb);
+                        }
+                    } catch (e) {
+                        log('  RPC 重放失败：' + (e.message || e));
+                    }
+                }
             }
             if (!blob && cap.found.length) {
                 log('  从 RPC 响应抓到原图地址：' + cap.found[0].slice(0, 150));
