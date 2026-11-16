@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.0.9
+// @version      1.1.1
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.0.9';
+    const VER = '1.1.1';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -376,12 +376,24 @@
         return src;
     }
 
+    /** 下载端点常把类型标成 octet-stream，按文件头纠正回来 */
+    async function sniffImage(blob) {
+        if (/^image\//i.test(blob.type || '')) return blob;
+        try {
+            const b = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+            if (b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return new Blob([blob], { type: 'image/jpeg' });
+            if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E) return new Blob([blob], { type: 'image/png' });
+            if (b[0] === 0x52 && b[1] === 0x49 && b[8] === 0x57) return new Blob([blob], { type: 'image/webp' });
+        } catch (e) { }
+        return blob;
+    }
+
     async function fetchBlob(url) {
         const res = await fetch(url, { credentials: 'include' });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const blob = await res.blob();
         if (blob.size < 2048) throw new Error('响应过小');
-        return blob;
+        return await sniffImage(blob);
     }
 
     const GOOD_TYPES = /^image\/(png|jpeg|jpg)$/i;
@@ -458,7 +470,7 @@
      */
     async function captureDownload(trigger) {
         const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-        const cap = { blob: null, href: null, name: '', urls: [] };
+        const cap = { blob: null, href: null, name: '', urls: [], rpc: [], found: [] };
         const undo = [];
 
         const pushUrl = (tag, u) => {
@@ -493,7 +505,8 @@
                 proto.click = function () {
                     try {
                         const h = this.href || '';
-                        if (!cap.href && (/^blob:/.test(h) || /googleusercontent|^https?:.*\.(jpg|jpeg|png|webp)/i.test(h))) {
+                        // 只要不是 javascript: 之类，一律截下来，宁可多拦也不放过
+                        if (!cap.href && /^(blob:|https?:)/i.test(h)) {
                             cap.href = h;
                             cap.name = this.download || '';
                             return;
@@ -511,19 +524,36 @@
             uw.open = function (url) {
                 try {
                     const u = String(url || '');
-                    if (/^blob:|googleusercontent/.test(u)) { if (!cap.href) cap.href = u; pushUrl('open', u); return null; }
+                    if (/^(blob:|https?:)/i.test(u)) {
+                        if (!cap.href) cap.href = u;
+                        pushUrl('open', u);
+                        return null;
+                    }
                 } catch (e) { }
                 return orig.apply(this, arguments);
             };
         } catch (e) { }
 
-        // 出口四：普通 fetch / XHR / 表单提交，只记录不拦截
+        // 出口四：fetch —— 顺手把 batchexecute 的响应体留下来，原图地址在里面
         try {
             const orig = uw.fetch;
             undo.push(() => { uw.fetch = orig; });
             uw.fetch = function (input) {
-                try { pushUrl('fetch', typeof input === 'string' ? input : (input && input.url)); } catch (e) { }
-                return orig.apply(this, arguments);
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                try { pushUrl('fetch', url); } catch (e) { }
+                const p = orig.apply(this, arguments);
+                try {
+                    if (/batchexecute/.test(url) && p && typeof p.then === 'function') {
+                        p.then((res) => {
+                            try {
+                                res.clone().text().then((t) => {
+                                    if (cap.rpc.length < 4) cap.rpc.push(t.slice(0, 30000));
+                                }).catch(() => { });
+                            } catch (e) { }
+                        }).catch(() => { });
+                    }
+                } catch (e) { }
+                return p;
             };
         } catch (e) { }
 
@@ -554,10 +584,22 @@
         try { trigger(); } catch (e) { }
 
         const t0 = Date.now();
-        while (!cap.blob && !cap.href && cap.urls.length === 0 && Date.now() - t0 < 3500) await sleep(250);
-        await sleep(300);
+        while (!cap.blob && !cap.href && cap.rpc.length === 0 && Date.now() - t0 < 5000) await sleep(300);
+        await sleep(500);
 
         undo.reverse().forEach((fn) => { try { fn(); } catch (e) { } });
+
+        // 从 batchexecute 响应里抠出原图地址（响应里的 = & / 常被转义）
+        cap.rpc.forEach((text) => {
+            const raw = String(text)
+                .replace(/\\u003d/g, '=').replace(/\\u0026/g, '&')
+                .replace(/\\u003f/g, '?').replace(/\\\//g, '/');
+            const hits = raw.match(/https:\/\/[^"'\s\\\]]{20,}/g) || [];
+            hits.forEach((u) => {
+                if (!/googleusercontent|gg-dl|\.jpe?g|\.png|\.webp/i.test(u)) return;
+                if (cap.found.indexOf(u) === -1 && cap.found.length < 8) cap.found.push(u);
+            });
+        });
 
         return cap;
     }
@@ -598,8 +640,17 @@
             if (!blob && cap.href) {
                 try { blob = await fetchBlob(cap.href); } catch (e) { }
             }
+            if (!blob && cap.found.length) {
+                log('  从 RPC 响应抓到原图地址：' + cap.found[0].slice(0, 150));
+                for (let k = 0; k < cap.found.length; k++) {
+                    try {
+                        const b2 = await fetchBlob(cap.found[k]);
+                        if (/^image\//i.test(b2.type) && b2.size > 8192) { blob = b2; break; }
+                    } catch (e) { }
+                }
+            }
             if (!blob && cap.urls.length) {
-                log('  点击触发：' + cap.urls.slice(0, 3).join(' ｜ ').slice(0, 320));
+                log('  点击触发：' + cap.urls.slice(0, 2).join(' ｜ ').slice(0, 200));
                 const cand = cap.urls
                     .map((s) => s.replace(/^\w+ /, ''))
                     .find((u) => /^https?:/.test(u) && /gg-dl|download|googleusercontent|\.jpe?g|\.png/i.test(u));
