@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.4.1
+// @version      1.5.0
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.4.1';
+    const VER = '1.5.0';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -458,6 +458,17 @@
         await sleep(500);
     }
 
+    const MIN_FULL_W = 1500;
+
+    async function blobSize(blob) {
+        try {
+            const bmp = await createImageBitmap(blob);
+            return { w: bmp.width, h: bmp.height };
+        } catch (e) {
+            return { w: 0, h: 0 };
+        }
+    }
+
     /** 记录尺寸和体积，用来自证取到的是不是原图 */
     async function blobMeta(blob) {
         let dim = '';
@@ -827,65 +838,64 @@
             } catch (e) { }
         }
 
-        // 2) 劫持「Download full size」背后的真实文件，自己命名保存
+        // 2) 取「Download full size」的真身：多渠道收集候选，按分辨率择优
         await revealToolbar(scope);
         const ctrl = findDownloadControl(scope);
         if (ctrl) {
             const cap = await captureDownload(() => ctrl.click());
-            let blob = cap.blob;
-            if (!blob && cap.href) {
-                try { blob = await fetchBlob(cap.href); } catch (e) { }
+            const cands = [];
+            const addCand = (b, via) => { if (b && b.size > 8192) cands.push({ blob: b, via }); };
+
+            addCand(cap.blob, '页面blob');
+            if (cap.href) {
+                try { addCand(await fetchBlob(cap.href), '下载链接'); } catch (e) { }
             }
-            if (!blob && cap.rpcCalls.length) {
-                for (let c = 0; c < cap.rpcCalls.length && !blob; c++) {
-                    try {
-                        const text = await replayRpc(cap.rpcCalls[c]);
-                        const cand = rpcCandidates(text);
-                        log(`  RPC 重放：${(text.length / 1024).toFixed(0)}KB，地址 ${cand.urls.length} 个${cand.b64 ? '，含内嵌图' : ''}`);
-                        for (let u = 0; u < cand.urls.length && !blob; u++) {
-                            try {
-                                const b = await fetchBlob(cand.urls[u]);
-                                if (/^image\//i.test(b.type) && b.size > 8192) blob = b;
-                            } catch (e) { }
-                        }
-                        if (!blob && cand.b64) {
-                            const bb = b64ToBlob(cand.b64);
-                            if (bb.size > 8192) blob = await sniffImage(bb);
-                        }
-                    } catch (e) {
-                        log('  RPC 重放失败：' + (e.message || e));
+            for (let c = 0; c < cap.rpcCalls.length; c++) {
+                try {
+                    const text = await replayRpc(cap.rpcCalls[c]);
+                    const cand = rpcCandidates(text);
+                    log(`  RPC 重放：${(text.length / 1024).toFixed(0)}KB，地址 ${cand.urls.length} 个${cand.b64 ? '，含内嵌图' : ''}`);
+                    for (let u = 0; u < cand.urls.length; u++) {
+                        try { addCand(await fetchBlob(cand.urls[u]), 'RPC地址'); } catch (e) { }
                     }
+                    if (cand.b64) {
+                        try { addCand(await sniffImage(b64ToBlob(cand.b64)), 'RPC内嵌图'); } catch (e) { }
+                    }
+                } catch (e) {
+                    log('  RPC 重放失败：' + (e.message || e));
                 }
             }
-            if (!blob && cap.found.length) {
-                log('  从 RPC 响应抓到原图地址：' + cap.found[0].slice(0, 150));
-                for (let k = 0; k < cap.found.length; k++) {
-                    try {
-                        const b2 = await fetchBlob(cap.found[k]);
-                        if (/^image\//i.test(b2.type) && b2.size > 8192) { blob = b2; break; }
-                    } catch (e) { }
-                }
+            for (let k = 0; k < cap.found.length; k++) {
+                try { addCand(await fetchBlob(cap.found[k]), 'RPC响应地址'); } catch (e) { }
             }
-            if (!blob && cap.urls.length) {
+            if (!cands.length && cap.urls.length) {
                 log('  点击触发：' + cap.urls.slice(0, 2).join(' ｜ ').slice(0, 200));
-                const cand = cap.urls
-                    .map((s) => s.replace(/^\w+ /, ''))
-                    .find((u) => /^https?:/.test(u) && /gg-dl|download|googleusercontent|\.jpe?g|\.png/i.test(u));
-                if (cand) {
-                    try {
-                        const b2 = await fetchBlob(cand);
-                        if (/^image\//i.test(b2.type)) blob = b2;
-                    } catch (e) { }
-                }
+                const u = cap.urls.map((s) => s.replace(/^\w+ /, ''))
+                    .find((x) => /^https?:/.test(x) && /gg-dl|download|googleusercontent|\.jpe?g|\.png/i.test(x));
+                if (u) { try { addCand(await fetchBlob(u), '点击请求'); } catch (e) { } }
             }
-            if (blob) {
-                const good = GOOD_TYPES.test(blob.type);
-                const out = good ? blob : await toPng(blob);
-                const name = baseName + '.' + mimeToExt(out.type);
-                triggerDownload(out, name);
-                const via = cap.blob ? '页面blob' : (cap.href ? '下载链接' : 'RPC地址');
-                log(`  取图：${out.type || '未知'} ${(out.size / 1048576).toFixed(2)}MB · 来源 ${via}${good ? '' : '（由 webp 转码）'}`);
-                return { name, from: good ? '原图' : 'webp转png', meta: await blobMeta(out) };
+
+            // 逐个量尺寸，挑最大的，小图一律不算原图
+            let best = null;
+            for (let i = 0; i < cands.length; i++) {
+                const t = (cands[i].blob.type || '').toLowerCase();
+                if (!GOOD_TYPES.test(t)) {
+                    log(`  候选 ${cands[i].via}：${t || '未知'} 非 png/jpg，跳过`);
+                    continue;
+                }
+                const d = await blobSize(cands[i].blob);
+                log(`  候选 ${cands[i].via}：${t.replace('image/', '')} ${d.w}×${d.h} ${(cands[i].blob.size / 1048576).toFixed(2)}MB`);
+                if (!best || d.w > best.w) best = { blob: cands[i].blob, via: cands[i].via, w: d.w, h: d.h };
+            }
+
+            if (best && best.w >= MIN_FULL_W) {
+                const name = baseName + '.' + mimeToExt(best.blob.type);
+                triggerDownload(best.blob, name);
+                log(`  取图成功：${best.w}×${best.h} · 来源 ${best.via}`);
+                return { name, from: '原图', meta: await blobMeta(best.blob) };
+            }
+            if (best) {
+                log(`  ⚠️ 最大只到 ${best.w}×${best.h}，低于原图阈值 ${MIN_FULL_W}px，改走原生下载`, 'warn');
             }
             if (!blob && cap.rpcCalls.length === 0) {
                 log('  ⚠️ 未取到下载请求体（可能是 Request 对象或二进制体）', 'warn');
