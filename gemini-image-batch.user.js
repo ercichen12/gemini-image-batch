@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.7.0
+// @version      1.7.1
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.7.0';
+    const VER = '1.7.1';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -942,7 +942,7 @@
                         const d = await blobSize(b);
                         log(`  候选 ${vs[k].slice(-8)}：${d.w}×${d.h} ${(b.size / 1048576).toFixed(2)}MB`);
                         if (!best || b.size > best.b.size) best = { b: b, d: d };
-                    } catch (e) { }
+                    } catch (e) { log(`  取图失败 ${vs[k].slice(-8)}：${e.message || e}`, 'warn'); }
                 }
             }
             if (best) {
@@ -950,6 +950,30 @@
                 triggerDownload(best.b, name);
                 log(`  ✓ 已保存 ${name}（${best.d.w}×${best.d.h} · ${(best.b.size / 1048576).toFixed(2)}MB）`);
                 return { name: name, from: '原图', meta: await blobMeta(best.b) };
+            }
+
+            // 取不到字节，但地址就是浏览器要导航去下载的那个：交给扩展按名下载
+            if (cand.urls.length && typeof GM_download === 'function') {
+                const u = cand.urls[0];
+                log('  改用扩展下载该地址 …', 'warn');
+                try {
+                    await new Promise((res, rej) => {
+                        GM_download({ url: u, name: baseName + '.jpg', saveAs: false, onload: res, onerror: rej });
+                    });
+                    log('  ✓ 已由扩展保存为 ' + baseName + '.jpg');
+                    return { name: baseName + '.jpg', from: '扩展下载', meta: '' };
+                } catch (e) {
+                    log('  ✗ 扩展下载失败：' + (e && e.message ? e.message : e), 'err');
+                }
+            }
+
+            // 最后：直接导航到该地址，至少让文件落到本地（名字归 Google）
+            if (cand.urls.length) {
+                try {
+                    log('  ↳ 改为直接打开下载地址 …', 'warn');
+                    location.href = cand.urls[0];   // 导航式下载，不会被弹窗拦截
+                    return { name: '（浏览器下载，文件名由 Google 生成）', from: '浏览器下载', meta: '' };
+                } catch (e) { }
             }
             log('  ⚠️ 从下载响应里没取到图片', 'warn');
         }
