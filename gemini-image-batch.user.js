@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.3.0
+// @version      1.3.1
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.3.0';
+    const VER = '1.3.1';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -334,21 +334,22 @@
             // 出图成功：生成已停止、有图、且连续两次轮询稳定
             if (!stop && imgs.length > 0 && stable >= 2) return { images: imgs };
 
-            // 判定失败：必须等到「生成确实结束」才下结论，避免刚发出去就误判
+            // 判定失败：必须等「生成确实结束」+ 冷却期，避免图还没渲染就下结论
             const ended = stop === false && (sawStop || Date.now() - start > 25000);
-            if (ended && imgs.length === 0 && stable >= 3) {
+            if (ended && imgs.length === 0 && stable >= 3 && Date.now() - start > 30000) {
                 const t = pageTextSample();
                 if (/(limit|quota|too many|try again|上限|额度|配额|次数已用|稍后再试)/i.test(t)) {
                     return { error: '配额或限流' };
                 }
                 if (t.trim().length > 40) return { error: '仅返回文字，未出图' };
-                return { error: '未检测到图片' };
+                // 其余情况不下结论，继续等到超时（宁可慢，也不丢掉已经生成好的图）
             }
 
             await sleep(1200);
         }
         if (peak > 0) return { error: '超时（已检测到图片但未稳定）' };
-        return { error: '等待超时' };
+        const sample = pageTextSample().replace(/\s+/g, ' ').slice(0, 80);
+        return { error: '未检测到图片 · 页面文字 ' + sample.length + ' 字' + (sample ? '：' + sample : '') };
     }
 
     /* -------------------------------- 图片下载 -------------------------------- */
@@ -473,6 +474,14 @@
      * 造一个 <a download> 去点、或 window.open。临时接管这三处，就能在它下载前
      * 把真正的原图截下来，我们自己做命名。
      */
+    let pendingUndo = [];
+
+    function restorePendingHooks() {
+        if (!pendingUndo.length) return;
+        pendingUndo.reverse().forEach((fn) => { try { fn(); } catch (e) { } });
+        pendingUndo = [];
+    }
+
     async function captureDownload(trigger) {
         const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
         const cap = { blob: null, href: null, name: '', urls: [], rpc: [], found: [], rpcCalls: [] };
@@ -610,13 +619,15 @@
             }
         } catch (e) { }
 
-        try { trigger(); } catch (e) { }
-
-        const t0 = Date.now();
-        while (!cap.blob && !cap.href && cap.rpc.length === 0 && Date.now() - t0 < 5000) await sleep(300);
-        await sleep(500);
-
-        undo.reverse().forEach((fn) => { try { fn(); } catch (e) { } });
+        pendingUndo = undo.slice();
+        try {
+            try { trigger(); } catch (e) { }
+            const t0 = Date.now();
+            while (!cap.blob && !cap.href && cap.rpc.length === 0 && Date.now() - t0 < 5000) await sleep(300);
+            await sleep(500);
+        } finally {
+            restorePendingHooks();
+        }
 
         // 从 batchexecute 响应里抠出原图地址（响应里的 = & / 常被转义）
         cap.rpc.forEach((text) => {
@@ -922,6 +933,9 @@
     async function tick() {
         if (busy) return;
         if (!S.running || S.paused) return;
+
+        // 保险：上一轮若因异常没还原钩子，这里兜底，避免污染页面请求
+        restorePendingHooks();
 
         if (S.cursor >= S.queue.length) {
             S.running = false;
