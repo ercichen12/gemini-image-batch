@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.0.0
+// @version      1.0.1
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,6 +21,8 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
+    const VER = '1.0.1';
+    try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
     const LS_KEY = 'gib_state_v1';
@@ -665,10 +667,19 @@
     `;
 
     function buildPanel() {
+        const old = document.getElementById('gib-host');
+        if (old) old.remove();
+
         const host = document.createElement('div');
         host.id = 'gib-host';
-        document.documentElement.appendChild(host);
-        root = host.attachShadow({ mode: 'open' });
+        host.style.cssText = 'all:initial;position:fixed;z-index:2147483600;';
+        (document.body || document.documentElement).appendChild(host);
+
+        try {
+            root = host.attachShadow({ mode: 'open' });
+        } catch (e) {
+            root = host; // 极少数环境不支持 shadow DOM，退化为普通节点
+        }
         root.innerHTML = '<style>' + PANEL_CSS + '</style>' + PANEL_HTML;
 
         const $ = (id) => root.getElementById(id);
@@ -865,20 +876,45 @@
 
     /* --------------------------------- 启动引导 ------------------------------- */
 
+    let bootTries = 0;
+
     function boot() {
-        buildPanel();
-        S.queue = parseQueue(S.raw, S.mode);
-        if (S.cursor > S.queue.length) S.cursor = 0;
-        render();
-        if (S.running && !S.paused && S.cursor < S.queue.length) {
-            log('检测到未完成任务，自动继续 …');
-            setTimeout(() => tick(), 1500);
+        try {
+            if (!document.body && !document.documentElement) throw new Error('DOM 尚未就绪');
+            buildPanel();
+            S.queue = parseQueue(S.raw, S.mode);
+            if (S.cursor > S.queue.length) S.cursor = 0;
+            render();
+            try { console.info('[GIB] 面板已渲染，队列 ' + S.queue.length + ' 条'); } catch (e) { }
+            if (S.running && !S.paused && S.cursor < S.queue.length) {
+                log('检测到未完成任务，自动继续 …');
+                setTimeout(() => tick(), 1500);
+            }
+        } catch (e) {
+            bootTries++;
+            try { console.error('[GIB] 面板初始化失败（第 ' + bootTries + ' 次）：', e); } catch (err) { }
+            if (bootTries <= 3) setTimeout(boot, 1200 * bootTries);
         }
     }
 
+    // 便于在控制台排查：__GIB.probe() / __GIB.show() / __GIB.info()
+    try {
+        window.__GIB = {
+            version: VER,
+            info: () => ({ version: VER, panel: !!document.getElementById('gib-host'), queue: S.queue.length, cursor: S.cursor, running: S.running }),
+            probe: () => probe(),
+            show: () => {
+                S.minimized = false; save(); render();
+                const h = document.getElementById('gib-host');
+                if (h) h.style.display = '';
+                return '已尝试显示面板';
+            }
+        };
+    } catch (e) { }
+
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => setTimeout(boot, 800));
+        document.addEventListener('DOMContentLoaded', () => setTimeout(boot, 600));
     } else {
-        setTimeout(boot, 800);
+        setTimeout(boot, 600);
     }
 })();
