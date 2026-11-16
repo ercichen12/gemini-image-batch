@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.0.1
+// @version      1.0.2
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.0.1';
+    const VER = '1.0.2';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -548,7 +548,6 @@
     let ui = {};
 
     const PANEL_CSS = `
-    :host { all: initial; }
     * { box-sizing: border-box; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
     .panel {
       position: fixed; right: 18px; bottom: 18px; width: 340px;
@@ -672,7 +671,7 @@
 
         const host = document.createElement('div');
         host.id = 'gib-host';
-        host.style.cssText = 'all:initial;position:fixed;z-index:2147483600;';
+        host.style.cssText = 'all:initial;z-index:2147483600;';
         (document.body || document.documentElement).appendChild(host);
 
         try {
@@ -681,6 +680,16 @@
             root = host; // 极少数环境不支持 shadow DOM，退化为普通节点
         }
         root.innerHTML = '<style>' + PANEL_CSS + '</style>' + PANEL_HTML;
+
+        // 兜底：关键定位用内联样式写死，即使 <style> 未生效面板也不会消失
+        const pEl = root.getElementById('panel');
+        if (pEl) {
+            pEl.style.cssText =
+                'position:fixed;right:18px;bottom:18px;width:340px;display:block;' +
+                'z-index:2147483600;background:#1b1b1f;color:#e9e9ec;' +
+                'border:1px solid #35353d;border-radius:12px;padding:0;' +
+                'font:12.5px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;';
+        }
 
         const $ = (id) => root.getElementById(id);
         ui = {
@@ -885,7 +894,7 @@
             S.queue = parseQueue(S.raw, S.mode);
             if (S.cursor > S.queue.length) S.cursor = 0;
             render();
-            try { console.info('[GIB] 面板已渲染，队列 ' + S.queue.length + ' 条'); } catch (e) { }
+            showBadge('批量生图脚本已加载 v' + VER + ' · 面板在右下角');
             if (S.running && !S.paused && S.cursor < S.queue.length) {
                 log('检测到未完成任务，自动继续 …');
                 setTimeout(() => tick(), 1500);
@@ -897,20 +906,62 @@
         }
     }
 
-    // 便于在控制台排查：__GIB.probe() / __GIB.show() / __GIB.info()
-    try {
-        window.__GIB = {
+    let badgeShown = false;
+
+    /** 首次加载时左下角闪一个提示条，用来确认脚本确实运行了 */
+    function showBadge(text) {
+        if (badgeShown) return;
+        badgeShown = true;
+        try {
+            const b = document.createElement('div');
+            b.textContent = text;
+            b.style.cssText =
+                'position:fixed;left:16px;bottom:16px;z-index:2147483600;' +
+                'background:#1b1b1f;color:#e9e9ec;border:1px solid #4c8dff;border-radius:8px;' +
+                'padding:8px 12px;font:12px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;' +
+                'box-shadow:0 6px 20px rgba(0,0,0,.35);transition:opacity .6s;opacity:1;' +
+                'pointer-events:none;';
+            (document.body || document.documentElement).appendChild(b);
+            setTimeout(() => { b.style.opacity = '0'; setTimeout(() => b.remove(), 700); }, 4200);
+        } catch (e) { }
+    }
+
+    // 便于在控制台排查：__GIB.info() / __GIB.probe() / __GIB.show()
+    // 注意：脚本带 @grant，跑在沙箱里，必须写到 unsafeWindow 才在页面控制台可见
+    function installDebugApi() {
+        const api = {
             version: VER,
-            info: () => ({ version: VER, panel: !!document.getElementById('gib-host'), queue: S.queue.length, cursor: S.cursor, running: S.running }),
+            info: () => ({
+                version: VER,
+                panel: !!document.getElementById('gib-host'),
+                queue: S.queue.length,
+                cursor: S.cursor,
+                running: S.running,
+                minimized: S.minimized
+            }),
             probe: () => probe(),
             show: () => {
-                S.minimized = false; save(); render();
+                S.minimized = false;
                 const h = document.getElementById('gib-host');
                 if (h) h.style.display = '';
-                return '已尝试显示面板';
+                const p = root && root.getElementById && root.getElementById('panel');
+                if (p) {
+                    p.style.display = 'block';
+                    p.style.right = '18px';
+                    p.style.bottom = '18px';
+                    p.style.left = 'auto';
+                    p.style.top = 'auto';
+                }
+                save(); render();
+                return '已显示面板';
             }
         };
-    } catch (e) { }
+        try { window.__GIB = api; } catch (e) { }
+        try { if (typeof unsafeWindow !== 'undefined') unsafeWindow.__GIB = api; } catch (e) { }
+        try { if (typeof unsafeWindow !== 'undefined') unsafeWindow.__GIB_LOADED__ = true; } catch (e) { }
+    }
+
+    installDebugApi();
 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', () => setTimeout(boot, 600));
