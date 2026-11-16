@@ -112,6 +112,7 @@ A：进度会保留，但脚本本身停了。重新打开页面后点「继续�
 ## 已知限制
 
 - 依赖 Gemini 网页结构，官方改版后可能需要更新选择器
+- **Gemini 启用了 Trusted Types（`require-trusted-types-for 'script'`），页面内任何 `innerHTML = 字符串` 都会被浏览器拦截。因此脚本里所有 DOM 一律用 `createElement` + `textContent` 构建，二次开发时请勿引入 `innerHTML`**
 - 只做纯文生图，不支持上传参考图做图生图
 - 不干预 `Aspect ratio` 和模型选择，请在页面上设好一次，循环沿用
 - 串行执行，一次只跑一条，不做并发

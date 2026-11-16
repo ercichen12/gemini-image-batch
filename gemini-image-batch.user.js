@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.0.3
+// @version      1.0.4
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.0.3';
+    const VER = '1.0.4';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -629,79 +629,112 @@
     .pill.show { display: flex; }
     `;
 
-    const PANEL_HTML = `
-    <div class="panel" id="panel">
-      <div class="head" id="head">
-        <span class="dot" id="dot"></span>
-        <span class="title">Gemini 批量生图</span>
-        <button class="ico" id="btnMin" title="收起">—</button>
-        <button class="ico" id="btnHide" title="隐藏（刷新页面后恢复）">×</button>
-      </div>
-      <div class="body">
-        <textarea id="ta" placeholder="粘贴生图提示词&#10;&#10;默认按空行分隔，一条提示词可以写多段。&#10;例：&#10;一只橘猫坐在窗台，晨光，胶片质感&#10;&#10;赛博朋克城市夜景，霓虹，广角"></textarea>
-        <div class="row">
-          <div class="seg">
-            <button data-mode="blank">空行分隔</button><button data-mode="line">每行一条</button>
-          </div>
-          <span class="count">共 <b id="cnt">0</b> 条</span>
-        </div>
-        <div class="row">
-          <button class="btn primary" id="btnStart">开始</button>
-          <button class="btn" id="btnSkip">跳过当前</button>
-          <button class="btn danger" id="btnReset">清空</button>
-        </div>
-        <div class="bar"><i id="bar"></i></div>
-        <div class="status" id="status">待命</div>
-        <div class="log" id="log"></div>
-        <details>
-          <summary>设置与自检</summary>
-          <div class="cfg">
-            <label>每条额外缓冲（秒）</label><input type="number" id="cfgDelay" min="0" max="120" step="1">
-            <label>单条超时（秒）</label><input type="number" id="cfgTimeout" min="30" max="900" step="10">
-            <label class="chk"><input type="checkbox" id="cfgNewChat"> 每条新开会话（推荐，避免风格串味）</label>
-            <label class="chk"><input type="checkbox" id="cfgAutoDl"> 自动下载生成的图片</label>
-          </div>
-          <div class="row">
-            <button class="btn" id="btnProbe">自检当前页面</button>
-          </div>
-        </details>
-      </div>
-    </div>
-    <div class="pill" id="pill"><span class="dot" id="dot2"></span><span id="pillText">0/0</span></div>
-    `;
-
-    /**
-     * Gemini 启用了 Trusted Types（CSP: require-trusted-types-for 'script'），
-     * 任何 innerHTML = 字符串 都会被浏览器拦截并抛出 TrustedHTML 错误。
-     * DOMParser 不在 Trusted Types 的注入点清单里，解析完再 importNode 导入即可绕过。
+    /* ------------------------- 面板 DOM（纯节点构建） -------------------------
+     * 不用任何 HTML 字符串：Gemini 有 Trusted Types，innerHTML / DOMParser+importNode
+     * 在沙箱里都靠不住，只有 createElement + textContent 是彻底干净的路径。
      */
-    function parseHTMLFragment(html) {
-        try {
-            const doc = new DOMParser().parseFromString('<!doctype html><body>' + html, 'text/html');
-            if (!doc || !doc.body) throw new Error('解析结果为空');
-            const frag = document.createDocumentFragment();
-            Array.from(doc.body.childNodes).forEach((n) => {
-                frag.appendChild(document.importNode(n, true));
+
+    function h(tag, attrs) {
+        const el = document.createElement(tag);
+        if (attrs) {
+            Object.keys(attrs).forEach((k) => {
+                const v = attrs[k];
+                if (v === null || v === undefined || v === false) return;
+                if (k === 'text') el.textContent = String(v);
+                else if (k === 'class') el.className = v;
+                else if (k === 'style') el.style.cssText = v;
+                else if (v === true) el.setAttribute(k, '');
+                else el.setAttribute(k, String(v));
             });
-            return frag;
-        } catch (e) {
-            console.error('[GIB] HTML 解析失败：', e);
-            return null;
         }
+        for (let i = 2; i < arguments.length; i++) {
+            const kid = arguments[i];
+            if (kid === null || kid === undefined || kid === false) continue;
+            if (Array.isArray(kid)) {
+                kid.forEach((k2) => { if (k2) el.appendChild(k2); });
+            } else if (typeof kid === 'string') {
+                el.appendChild(document.createTextNode(kid));
+            } else {
+                el.appendChild(kid);
+            }
+        }
+        return el;
     }
 
-    function buildMinimalPanel() {
-        const wrap = document.createElement('div');
-        wrap.id = 'panel';
-        wrap.style.cssText =
-            'position:fixed;right:18px;bottom:18px;width:300px;background:#1b1b1f;color:#e9e9ec;' +
-            'padding:14px;border-radius:12px;border:1px solid #35353d;z-index:2147483600;' +
-            'font:12px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;';
-        const t = document.createElement('div');
-        t.textContent = '面板渲染降级：请把这段提示反馈给作者';
-        wrap.appendChild(t);
-        return wrap;
+    function buildPanelNodes() {
+        const dot = h('span', { class: 'dot', id: 'dot' });
+
+        const head = h('div', { class: 'head', id: 'head' },
+            dot,
+            h('span', { class: 'title', text: 'Gemini 批量生图' }),
+            h('button', { class: 'ico', id: 'btnMin', title: '收起', text: '—' }),
+            h('button', { class: 'ico', id: 'btnHide', title: '隐藏（刷新页面后恢复）', text: '×' })
+        );
+
+        const ta = h('textarea', {
+            id: 'ta',
+            placeholder: '粘贴生图提示词\n\n默认按空行分隔，一条提示词可以写多段。\n例：\n一只橘猫坐在窗台，晨光，胶片质感\n\n赛博朋克城市夜景，霓虹，广角'
+        });
+
+        const seg = h('div', { class: 'seg' },
+            h('button', { 'data-mode': 'blank', text: '空行分隔' }),
+            h('button', { 'data-mode': 'line', text: '每行一条' })
+        );
+
+        const row1 = h('div', { class: 'row' },
+            seg,
+            h('span', { class: 'count' }, '共 ', h('b', { id: 'cnt', text: '0' }), ' 条')
+        );
+
+        const row2 = h('div', { class: 'row' },
+            h('button', { class: 'btn primary', id: 'btnStart', text: '开始' }),
+            h('button', { class: 'btn', id: 'btnSkip', text: '跳过当前' }),
+            h('button', { class: 'btn danger', id: 'btnReset', text: '清空' })
+        );
+
+        const bar = h('div', { class: 'bar' }, h('i', { id: 'bar' }));
+
+        const cfg = h('div', { class: 'cfg' },
+            h('label', { text: '每条额外缓冲（秒）' }),
+            h('input', { type: 'number', id: 'cfgDelay', min: '0', max: '120', step: '1' }),
+            h('label', { text: '单条超时（秒）' }),
+            h('input', { type: 'number', id: 'cfgTimeout', min: '30', max: '900', step: '10' }),
+            h('label', { class: 'chk' }, h('input', { type: 'checkbox', id: 'cfgNewChat' }), ' 每条新开会话（推荐，避免风格串味）'),
+            h('label', { class: 'chk' }, h('input', { type: 'checkbox', id: 'cfgAutoDl' }), ' 自动下载生成的图片')
+        );
+
+        const details = h('details', null,
+            h('summary', { text: '设置与自检' }),
+            cfg,
+            h('div', { class: 'row' }, h('button', { class: 'btn', id: 'btnProbe', text: '自检当前页面' }))
+        );
+
+        const body = h('div', { class: 'body' },
+            ta,
+            row1,
+            row2,
+            bar,
+            h('div', { class: 'status', id: 'status', text: '待命' }),
+            h('div', { class: 'log', id: 'log' }),
+            details
+        );
+
+        const panel = h('div', { class: 'panel', id: 'panel' }, head, body);
+        panel.style.cssText =
+            'position:fixed;right:18px;bottom:18px;width:340px;display:block;' +
+            'z-index:2147483600;background:#1b1b1f;color:#e9e9ec;' +
+            'border:1px solid #35353d;border-radius:12px;' +
+            'font:12.5px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;' +
+            'box-shadow:0 8px 28px rgba(0,0,0,.45);overflow:hidden;';
+
+        const pill = h('div', { class: 'pill', id: 'pill' },
+            h('span', { class: 'dot', id: 'dot2' }),
+            h('span', { id: 'pillText', text: '0/0' })
+        );
+
+        return { panel, pill };
     }
+
 
     function buildPanel() {
         const old = document.getElementById('gib-host');
@@ -723,31 +756,10 @@
         styleEl.textContent = PANEL_CSS;
         root.appendChild(styleEl);
 
-        const frag = parseHTMLFragment(PANEL_HTML);
-        if (frag) {
-            root.appendChild(frag);
-        } else {
-            root.appendChild(buildMinimalPanel());
-        }
-
-        // 兜底：关键定位用内联样式写死，即使 <style> 未生效面板也不会消失
-        const pEl = root.getElementById('panel');
-        if (!pEl) {
-            // 解析出的结构不完整，整块换成最简面板，至少让用户看到提示
-            while (root.firstChild) root.removeChild(root.firstChild);
-            const s2 = document.createElement('style');
-            s2.textContent = PANEL_CSS;
-            root.appendChild(s2);
-            root.appendChild(buildMinimalPanel());
-            return;
-        }
-        {
-            pEl.style.cssText =
-                'position:fixed;right:18px;bottom:18px;width:340px;display:block;' +
-                'z-index:2147483600;background:#1b1b1f;color:#e9e9ec;' +
-                'border:1px solid #35353d;border-radius:12px;padding:0;' +
-                'font:12.5px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;';
-        }
+        // 纯节点构建，不解析任何 HTML
+        const nodes = buildPanelNodes();
+        root.appendChild(nodes.panel);
+        root.appendChild(nodes.pill);
 
         const $ = (id) => root.getElementById(id);
         ui = {
