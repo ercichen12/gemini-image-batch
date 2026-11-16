@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.5.5
+// @version      1.6.0
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.5.5';
+    const VER = '1.6.0';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -550,9 +550,12 @@
         pendingUndo = [];
     }
 
-    async function captureDownload(trigger) {
+    async function captureDownload(trigger, wantName) {
         const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-        const cap = { blob: null, href: null, name: '', urls: [], rpc: [], found: [], rpcCalls: [] };
+        const cap = {
+            blob: null, href: null, name: '', urls: [], rpc: [], found: [], rpcCalls: [],
+            renamed: false, renameFailed: false, newWindow: false
+        };
         const undo = [];
 
         const pushUrl = (tag, u) => {
@@ -587,13 +590,21 @@
                 proto.click = function () {
                     try {
                         const h = this.href || '';
-                        // 只要不是 javascript: 之类，一律截下来，宁可多拦也不放过
-                        if (!cap.href && /^(blob:|https?:)/i.test(h)) {
-                            cap.href = h;
-                            cap.name = this.download || '';
-                            return;
+                        if (/^(blob:|https?:)/i.test(h)) {
+                            if (!cap.href) { cap.href = h; cap.name = this.download || ''; }
+                            if (wantName) {
+                                // 只有同源/blob 链接，download 属性才会被浏览器采纳
+                                const sameOrigin = /^blob:/i.test(h) || h.indexOf(location.origin) === 0;
+                                if (sameOrigin) {
+                                    this.download = wantName;
+                                    cap.renamed = true;
+                                } else {
+                                    cap.renameFailed = true;
+                                }
+                            }
                         }
                     } catch (e) { }
+                    // 一律放行：让浏览器照常下载
                     return orig.apply(this, arguments);
                 };
             }
@@ -608,55 +619,27 @@
                     const u = String(url || '');
                     if (/^(blob:|https?:)/i.test(u)) {
                         if (!cap.href) cap.href = u;
+                        cap.newWindow = true;
                         pushUrl('open', u);
-                        return null;
                     }
                 } catch (e) { }
                 return orig.apply(this, arguments);
             };
         } catch (e) { }
 
-        // 出口四：fetch —— 顺手把 batchexecute 的响应体留下来，原图地址在里面
+        // 出口四：fetch —— 只记录，不拦截（页面照常下载）
         try {
             const orig = uw.fetch;
             undo.push(() => { uw.fetch = orig; });
             uw.fetch = function (input, init) {
                 const url = typeof input === 'string' ? input : (input && input.url) || '';
                 try { pushUrl('fetch', url); } catch (e) { }
-
-                const isDownloadRpc = /rpcids=c8o8Fe/.test(url);
-                const bodyStr = /batchexecute/.test(url) ? readBodySync(init && init.body) : null;
-
-                if (isDownloadRpc) {
-                    // 同步就能拿到请求体：抑制页面下载，我们重放
-                    if (bodyStr) {
-                        if (cap.rpcCalls.length < 3) cap.rpcCalls.push({ url: url, body: bodyStr });
-                        try {
-                            cap.suppressed = true;
-                            return Promise.resolve(fakeRpcResponse());
-                        } catch (e) { }
+                try {
+                    if (/batchexecute/.test(url) && cap.rpcCalls.length < 3) {
+                        const b = readBodySync(init && init.body);
+                        if (b) cap.rpcCalls.push({ url: url, body: b });
                     }
-
-                    // Request 对象：克隆后异步读，读到了才抑制
-                    if (input && typeof input !== 'string' && input.clone) {
-                        try {
-                            return input.clone().text().then(function (t) {
-                                if (t && t.length > 8 && cap.rpcCalls.length < 3) cap.rpcCalls.push({ url: url, body: t });
-                                if (t && t.length > 8) {
-                                    cap.suppressed = true;
-                                    return fakeRpcResponse();
-                                }
-                                return orig.call(uw, input, init);
-                            }).catch(function () {
-                                return orig.call(uw, input, init);
-                            });
-                        } catch (e) { }
-                    }
-
-                    // 实在拿不到请求体：不抑制，让页面自己下载（保图优先）
-                    cap.unsuppressed = true;
-                }
-
+                } catch (e) { }
                 return orig.apply(this, arguments);
             };
         } catch (e) { }
@@ -861,139 +844,73 @@
      * 把所有能拿到的字节都当候选，最后按分辨率择优。
      * 只有 ≥ MIN_FULL_W 才算原图；否则退回页面原生下载，绝不拿缩略图充数。
      */
-    async function saveOneImage(img, baseName, preferred) {
+    /**
+     * 让浏览器自己下载（保证拿到原图），只做一件事：把文件名改成我们的。
+     * 能不能改取决于 Gemini 的触发方式：
+     *   <a download> + 同源/blob  -> 改 download 属性即可
+     *   <a download> + 跨域      -> 浏览器忽略属性，改用 GM_download 取同一份
+     *   新窗口 / 整页跳转        -> 网页无权干涉，只能保持 Google 命名
+     */
+    async function saveOneImage(img, baseName) {
         if (!img || !img.src) throw new Error('图片元素无效');
-        const src = img.src;
         const scope = imageScope(img);
-        const cands = [];
-        const addCand = (b, via) => { if (b && b.size > 8192) cands.push({ blob: b, via }); };
 
-        // 0) 生成阶段抓到的字节
-        if (preferred) {
-            try { addCand(await sniffImage(preferred), '生成阶段'); } catch (e) { }
-        }
-
-        // 1) 页面这张图本身
-        try {
-            const b0 = await fetchBlob(src);
-            log(`  页面图规格：${/webp/i.test(b0.type) ? 'webp' : b0.type.replace('image/', '')} ${await blobMeta(b0)}`);
-            addCand(b0, '页面图');
-        } catch (e) { }
-
-        // 2) 把尺寸参数改成 s0
-        const full = toFullSizeUrl(src);
-        if (full !== src) {
-            try { addCand(await fetchBlob(full), '地址改写'); }
-            catch (e) { log('  地址改写取图失败：' + (e.message || e), 'warn'); }
-        }
-
-        // 3) 点下载按钮，把能截到的出口全收一遍
         let ctrl = null;
         try {
             await revealToolbar(scope);
             ctrl = findDownloadControl(scope);
         } catch (e) { }
+        if (!ctrl) throw new Error('找不到下载按钮');
 
-        if (ctrl) {
-            const cap = await captureDownload(() => ctrl.click());
-            addCand(cap.blob, '页面blob');
-            if (cap.href) {
-                try { addCand(await fetchBlob(cap.href), '下载链接'); }
-                catch (e) { log('  下载链接取图失败：' + (e.message || e), 'warn'); }
-            }
-            for (let c = 0; c < cap.rpcCalls.length; c++) {
-                try {
-                    const text = await replayRpc(cap.rpcCalls[c]);
-                    const cand = rpcCandidates(text);
-                    log(`  RPC 重放：${text.length}B，地址 ${cand.urls.length} 个${cand.b64 ? '，内嵌图 ' + Math.round(cand.b64.length / 1024) + 'KB' : ''}`);
-                    if (cand.urls.length) {
-                        const u0 = cand.urls[0];
-                        log('  RPC 地址：' + u0.slice(0, 70) + ' … ' + u0.slice(-50));
-                    }
-                    for (let u = 0; u < cand.urls.length; u++) {
-                        const vs = sizeVariants(cand.urls[u]);
-                        for (let v = 0; v < vs.length; v++) {
-                            try { addCand(await fetchBlob(vs[v]), v === 0 ? 'RPC地址' : 'RPC改尺寸'); }
-                            catch (e) { if (v === 0) log('  RPC 地址取图失败：' + (e.message || e), 'warn'); }
-                        }
-                    }
-                    if (cand.b64) {
-                        try { addCand(await sniffImage(b64ToBlob(cand.b64)), 'RPC内嵌图'); }
-                        catch (e) { log('  RPC 内嵌图解码失败：' + (e.message || e), 'warn'); }
-                    }
-                } catch (e) {
-                    log('  RPC 重放失败：' + (e.message || e), 'warn');
-                }
-            }
-            for (let k = 0; k < cap.found.length; k++) {
-                try { addCand(await fetchBlob(cap.found[k]), 'RPC响应地址'); } catch (e) { }
-            }
-            if (!cap.rpcCalls.length) log('  ⚠️ 未取到下载请求体', 'warn');
-            if (cap.suppressed) log('  已接管下载接口', 'warn');
+        const cap = await captureDownload(() => ctrl.click(), baseName);
+
+        if (cap.renamed) {
+            log('  ✓ 已改名为 ' + baseName + '，由浏览器下载');
+            return { name: baseName, from: '浏览器下载', meta: '' };
         }
 
-        // 4) 逐个量尺寸，挑最大的
-        let best = null;
-        for (let i = 0; i < cands.length; i++) {
-            const t = (cands[i].blob.type || '').toLowerCase();
-            if (!GOOD_TYPES.test(t)) {
-                log(`  候选 ${cands[i].via}：${t || '未知'} 非 png/jpg，跳过`);
-                continue;
-            }
-            const d = await blobSize(cands[i].blob);
-            log(`  候选 ${cands[i].via}：${t.replace('image/', '')} ${d.w}×${d.h} ${(cands[i].blob.size / 1048576).toFixed(2)}MB`);
-            // 先比宽度，同宽度再比体积（同尺寸下 =d 的原始文件明显更大）
-            const better = !best || d.w > best.w ||
-                (d.w === best.w && cands[i].blob.size > best.blob.size);
-            if (better) best = { blob: cands[i].blob, via: cands[i].via, w: d.w, h: d.h };
-        }
+        log('  ⚠️ ' + (cap.newWindow
+            ? '下载在新窗口触发，网页无权改名'
+            : cap.renameFailed
+                ? '下载链接跨域，浏览器不接受自定义文件名'
+                : '未捕捉到下载链接（可能是整页跳转），网页无权改名'), 'warn');
 
-        if (best && best.w >= MIN_FULL_W) {
-            const name = baseName + '.' + mimeToExt(best.blob.type);
-            triggerDownload(best.blob, name);
-            log(`  取图成功：${best.w}×${best.h} · 来源 ${best.via}`);
-            return { name, from: '原图', meta: await blobMeta(best.blob) };
-        }
-        if (best) log(`  ⚠️ 最大只到 ${best.w}×${best.h}，低于阈值 ${MIN_FULL_W}px，改走原生下载`, 'warn');
-
-        // 5) 兜底：让页面自己下载，保证拿到真原图（文件名归 Google）
-        for (let attempt = 0; attempt < 3; attempt++) {
-            await sleep(1200 + attempt * 800);
+        if (cap.href && /^https?:/i.test(cap.href)) {
             try {
-                await revealToolbar(scope);
-                const again = findDownloadControl(scope) || ctrl;
-                if (again && !again.disabled && again.getAttribute('aria-disabled') !== 'true') {
-                    again.click();
-                    log('  ↳ 已退回页面原生下载（文件名由 Google 生成）', 'warn');
-                    return { name: '（页面原生下载，文件名由 Google 生成）', from: '按钮' };
+                const bl = await fetchBlob(cap.href);
+                const name = baseName + '.' + mimeToExt(bl.type);
+                triggerDownload(bl, name);
+                log('  ✓ 已按自定义名保存：' + name);
+                return { name, from: '下载链接', meta: await blobMeta(bl) };
+            } catch (e) {
+                log('  页面内取图失败：' + (e.message || e), 'warn');
+            }
+            if (typeof GM_download === 'function') {
+                try {
+                    await new Promise((res, rej) => {
+                        GM_download({ url: cap.href, name: baseName, saveAs: false, onload: res, onerror: rej });
+                    });
+                    log('  ✓ 已由扩展保存为 ' + baseName);
+                    return { name: baseName, from: '扩展下载', meta: '' };
+                } catch (e2) {
+                    log('  ✗ 扩展下载失败：' + (e2 && e2.message ? e2.message : e2), 'err');
                 }
-            } catch (e) { }
+            }
         }
-        log('  ⚠️ 下载按钮始终不可点，请手动点一次 Download full size', 'warn');
-        return { name: '（未下载：按钮不可点）', from: '按钮' };
+
+        return { name: '（浏览器下载，文件名由 Google 生成）', from: '浏览器下载', meta: '' };
     }
 
-    /** 队列跑完自动导出清单和对照页 */
-    function autoExportIfNeeded() {
-        if (!S.autoExport || S.exported) return;
-        if (!recordKeys().length) return;
-        S.exported = true;
-        save();
-        exportAs('csv');
-        setTimeout(() => exportAs('html'), 1000);
-        setTimeout(() => exportAs('log'), 2000);
-    }
-
-    async function downloadAll(images, idx, prompt, preferred) {
+    async function downloadAll(images, idx, prompt) {
         const base = String(idx + 1).padStart(3, '0') + '_' + slug(prompt, 40);
         const out = [];
         for (let i = 0; i < images.length; i++) {
             const suffix = images.length > 1 ? '_' + (i + 1) : '';
             try {
-                const r = await saveOneImage(images[i].el, base + suffix, i === 0 ? preferred : null);
+                const r = await saveOneImage(images[i].el, base + suffix);
                 out.push(r);
                 log(`⬇ 已保存 ${r.name}（${r.from}${r.meta ? ' ' + r.meta : ''}）`);
-                await sleep(r.from === '按钮' ? 900 : 400);
+                await sleep(900);
             } catch (e) {
                 log(`✗ 第 ${i + 1} 张保存失败：${e.message || e}`);
             }
@@ -1171,28 +1088,17 @@
                 baseline = new Set();
             }
 
-            startNetProbe();
             const result = await waitImages();
-            const probe = netProbe
-                ? { blob: netProbe.blob, urls: (netProbe.urls || []).slice(0, 6) }
-                : null;
-            stopNetProbe();
-
             if (result.error) {
                 const quota = /配额|限流/.test(result.error);
                 return fail(idx, result.error, quota);
             }
 
             log(`  出图 ${result.images.length} 张`);
-            if (probe && probe.blob) {
-                log(`  生成阶段抓到图片字节 ${(probe.blob.size / 1048576).toFixed(2)}MB（${probe.blob.type || '未知类型'}）`);
-            } else if (probe && probe.urls.length) {
-                log(`  生成阶段见到 ${probe.urls.length} 个疑似图片地址，未取到字节`);
-            }
             let saved = [];
-            if (S.autoDownload) saved = await downloadAll(result.images, idx, prompt, probe && probe.blob);
+            if (S.autoDownload) saved = await downloadAll(result.images, idx, prompt);
 
-            const owned = (saved || []).filter((r) => r.from !== '按钮');
+            const owned = (saved || []).filter((r) => r.name && r.name.charAt(0) !== '（');
             updateRecord(idx, {
                 prompt,
                 state: (saved.length > 0 || !S.autoDownload) ? 'ok' : 'fail',
