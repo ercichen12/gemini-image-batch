@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.7.1
+// @version      1.7.2
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.7.1';
+    const VER = '1.7.2';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -932,13 +932,27 @@
         if (cap.rpcText) {
             const cand = rpcCandidates(cap.rpcText);
             log(`  页面下载响应：${cap.rpcText.length}B，地址 ${cand.urls.length} 个`);
+            // 优先：交给扩展按名下载同一地址（已验证可拿到原始文件）
+            if (cand.urls.length && typeof GM_download === 'function') {
+                log('  改用扩展下载该地址 …', 'warn');
+                try {
+                    await new Promise((res, rej) => {
+                        GM_download({ url: cand.urls[0], name: baseName + '.jpg', saveAs: false, onload: res, onerror: rej });
+                    });
+                    log('  ✓ 已由扩展保存为 ' + baseName + '.jpg');
+                    return { name: baseName + '.jpg', from: '扩展下载', meta: '' };
+                } catch (e) {
+                    log('  ✗ 扩展下载失败：' + (e && e.message ? e.message : e), 'err');
+                }
+            }
+
             let best = null;
             for (let i = 0; i < cand.urls.length; i++) {
                 const vs = sizeVariants(cand.urls[i]);
                 for (let k = 0; k < vs.length; k++) {
                     try {
                         const b = await fetchBlob(vs[k]);
-                        if (!/^image//i.test(b.type)) continue;
+                        if (!/^image\//i.test(b.type)) continue;
                         const d = await blobSize(b);
                         log(`  候选 ${vs[k].slice(-8)}：${d.w}×${d.h} ${(b.size / 1048576).toFixed(2)}MB`);
                         if (!best || b.size > best.b.size) best = { b: b, d: d };
