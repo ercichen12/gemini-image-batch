@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.6.4
+// @version      1.7.0
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.6.4';
+    const VER = '1.7.0';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -663,20 +663,35 @@
             };
         } catch (e) { }
 
-        // 出口四：fetch —— 只记录，不拦截（页面照常下载）
+        // 出口四：fetch —— 下载 RPC 由我们代办：读真响应，回假响应阻止页面自己导航下载
         try {
             const orig = uw.fetch;
             undo.push(() => { uw.fetch = orig; });
             uw.fetch = function (input, init) {
                 const url = typeof input === 'string' ? input : (input && input.url) || '';
                 try { pushUrl('fetch', url); } catch (e) { }
+
+                if (!/rpcids=c8o8Fe/.test(url)) return orig.apply(this, arguments);
+
                 try {
-                    if (/batchexecute/.test(url) && cap.rpcCalls.length < 3) {
+                    if (cap.rpcCalls.length < 3) {
                         const b = readBodySync(init && init.body);
                         if (b) cap.rpcCalls.push({ url: url, body: b });
                     }
                 } catch (e) { }
-                return orig.apply(this, arguments);
+
+                let p;
+                try { p = orig.apply(this, arguments); } catch (e) { p = null; }
+                return Promise.resolve(p).then(function (res) {
+                    try {
+                        res.clone().text().then(function (t) { cap.rpcText = t; }).catch(function () { });
+                    } catch (e) { }
+                    cap.suppressed = true;
+                    return fakeRpcResponse();
+                }).catch(function () {
+                    cap.suppressed = true;
+                    return fakeRpcResponse();
+                });
             };
         } catch (e) { }
 
@@ -711,10 +726,10 @@
             // 实测点击后约 35 秒才真正下载；一旦某轮抓不到就缩短后续等待
             const waitMs = S.capFail ? 12000 : 60000;
             while (Date.now() - t0 < waitMs) {
-                if (cap.renamed || cap.href) break;
+                if (cap.renamed || cap.href || cap.rpcText) break;
                 await sleep(300);
             }
-            if (cap.renamed || cap.href) {
+            if (cap.renamed || cap.href || cap.rpcText) {
                 log(`  点击后 ${Math.round((Date.now() - t0) / 1000)} 秒捕捉到下载动作`);
             } else {
                 log('  等了 ' + Math.round(waitMs / 1000) + ' 秒仍未捕捉到下载动作', 'warn');
@@ -905,7 +920,7 @@
         if (!ctrl) throw new Error('下载按钮未就绪');
 
         const cap = await captureDownload(() => ctrl.click(), baseName);
-        if (!cap.renamed && !cap.href) { S.capFail = true; save(); }
+        if (!cap.renamed && !cap.href && !cap.rpcText) { S.capFail = true; save(); }
         log(`  捕捉结果：链接${cap.href ? '有' : '无'} · 改名${cap.renamed ? '成功' : '未成功'}${cap.newWindow ? ' · 新窗口' : ''}${cap.renameFailed ? ' · 跨域' : ''} · 页面blob${cap.blob ? '有' : '无'}`);
 
         if (cap.renamed) {
@@ -913,45 +928,40 @@
             return { name: baseName, from: '浏览器下载', meta: '' };
         }
 
-        log('  ⚠️ ' + (cap.newWindow
-            ? '下载在新窗口触发，网页无权改名'
-            : cap.renameFailed
-                ? '下载链接跨域，浏览器不接受自定义文件名'
-                : '未捕捉到下载链接（可能是整页跳转），网页无权改名'), 'warn');
-
-        if (cap.href && /^https?:/i.test(cap.href)) {
-            try {
-                const bl = await fetchBlob(cap.href);
-                const name = baseName + '.' + mimeToExt(bl.type);
-                triggerDownload(bl, name);
-                log('  ✓ 已按自定义名保存：' + name);
-                return { name, from: '下载链接', meta: await blobMeta(bl) };
-            } catch (e) {
-                log('  页面内取图失败：' + (e.message || e), 'warn');
-            }
-            if (typeof GM_download === 'function') {
-                try {
-                    await new Promise((res, rej) => {
-                        GM_download({ url: cap.href, name: baseName, saveAs: false, onload: res, onerror: rej });
-                    });
-                    log('  ✓ 已由扩展保存为 ' + baseName);
-                    return { name: baseName, from: '扩展下载', meta: '' };
-                } catch (e2) {
-                    log('  ✗ 扩展下载失败：' + (e2 && e2.message ? e2.message : e2), 'err');
+        // 用页面那次下载响应的真实地址取图（不是重放，字节应与浏览器一致）
+        if (cap.rpcText) {
+            const cand = rpcCandidates(cap.rpcText);
+            log(`  页面下载响应：${cap.rpcText.length}B，地址 ${cand.urls.length} 个`);
+            let best = null;
+            for (let i = 0; i < cand.urls.length; i++) {
+                const vs = sizeVariants(cand.urls[i]);
+                for (let k = 0; k < vs.length; k++) {
+                    try {
+                        const b = await fetchBlob(vs[k]);
+                        if (!/^image//i.test(b.type)) continue;
+                        const d = await blobSize(b);
+                        log(`  候选 ${vs[k].slice(-8)}：${d.w}×${d.h} ${(b.size / 1048576).toFixed(2)}MB`);
+                        if (!best || b.size > best.b.size) best = { b: b, d: d };
+                    } catch (e) { }
                 }
             }
+            if (best) {
+                const name = baseName + '.' + mimeToExt(best.b.type);
+                triggerDownload(best.b, name);
+                log(`  ✓ 已保存 ${name}（${best.d.w}×${best.d.h} · ${(best.b.size / 1048576).toFixed(2)}MB）`);
+                return { name: name, from: '原图', meta: await blobMeta(best.b) };
+            }
+            log('  ⚠️ 从下载响应里没取到图片', 'warn');
         }
 
-        // 全都没成：至少让浏览器自己下一次，别让这一轮空着
-        if (cap.swallowed) {
-            try {
-                await sleep(500);
-                await revealToolbar(scope);
-                const again = findDownloadControl(scope) || ctrl;
-                if (again) again.click();
-                log('  ↳ 已退回原生下载，文件名归 Google', 'warn');
-            } catch (e) { }
-        }
+        // 兜底：让浏览器自己下一次，保证这一轮不空手
+        try {
+            await sleep(800);
+            await revealToolbar(scope);
+            const again = findDownloadControl(scope) || ctrl;
+            if (again && !isDisabled(again)) again.click();
+            log('  ↳ 已退回原生下载，文件名归 Google', 'warn');
+        } catch (e) { }
         return { name: '（浏览器下载，文件名由 Google 生成）', from: '浏览器下载', meta: '' };
     }
 
