@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.1.1
+// @version      1.2.0
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.1.1';
+    const VER = '1.2.0';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -32,6 +32,9 @@
         mode: 'blank',      // blank = 空行分隔, line = 每行一条
         cursor: 0,
         statuses: [],       // { state, files, reason }
+        records: {},        // index -> { prompt, state, files, meta, session, at, reason, nativeCount }
+        autoExport: true,
+        exported: false,
         sentAt: {},         // index -> 时间戳，防止刷新后重复发送
         running: false,
         paused: false,
@@ -57,6 +60,7 @@
         }
         if (!out.sentAt || typeof out.sentAt !== 'object') out.sentAt = {};
         if (!Array.isArray(out.statuses)) out.statuses = [];
+        if (!out.records || typeof out.records !== 'object') out.records = {};
         out.queue = parseQueue(out.raw, out.mode);
         if (out.cursor > out.queue.length) out.cursor = 0;
         return out;
@@ -90,12 +94,13 @@
         return null;
     }
 
-    function slug(text) {
+    function slug(text, max) {
+        const n = max || 20;
         return String(text || '')
             .replace(/[\\/:*?"<>|\r\n\t]/g, ' ')
             .replace(/\s+/g, '_')
             .replace(/^_+|_+$/g, '')
-            .slice(0, 20) || 'prompt';
+            .slice(0, n) || 'prompt';
     }
 
     function parseQueue(raw, mode) {
@@ -701,21 +706,124 @@
         }
     }
 
+    /** 队列跑完自动导出清单和对照页 */
+    function autoExportIfNeeded() {
+        if (!S.autoExport || S.exported) return;
+        if (!recordKeys().length) return;
+        S.exported = true;
+        save();
+        exportAs('csv');
+        setTimeout(() => exportAs('html'), 1000);
+    }
+
     async function downloadAll(images, idx, prompt) {
-        const base = String(idx + 1).padStart(3, '0') + '_' + slug(prompt);
-        let ok = 0;
+        const base = String(idx + 1).padStart(3, '0') + '_' + slug(prompt, 40);
+        const out = [];
         for (let i = 0; i < images.length; i++) {
             const suffix = images.length > 1 ? '_' + (i + 1) : '';
             try {
                 const r = await saveOneImage(images[i].el, base + suffix);
-                ok++;
+                out.push(r);
                 log(`⬇ 已保存 ${r.name}（${r.from}${r.meta ? ' ' + r.meta : ''}）`);
                 await sleep(r.from === '按钮' ? 900 : 400);
             } catch (e) {
                 log(`✗ 第 ${i + 1} 张保存失败：${e.message || e}`);
             }
         }
-        return ok;
+        return out;
+    }
+
+    /** 记录：提示词 ↔ 图片 ↔ 会话，清单与对照页的数据源 */
+    function updateRecord(idx, patch) {
+        if (!S.records) S.records = {};
+        const cur = S.records[idx] || { prompt: S.queue[idx] || '', at: Date.now() };
+        S.records[idx] = Object.assign(cur, patch);
+        save();
+    }
+
+    function csvCell(v) {
+        const s = (v === null || v === undefined) ? '' : String(v);
+        return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+
+    function esc(s) {
+        return String(s === null || s === undefined ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function recordKeys() {
+        return Object.keys(S.records || {}).map(Number).sort((a, b) => a - b);
+    }
+
+    function buildCsv() {
+        const rows = [['序号', '状态', '提示词', '文件名', '张数', '规格', '会话链接', '完成时间', '备注'].join(',')];
+        recordKeys().forEach((k) => {
+            const r = S.records[k] || {};
+            rows.push([
+                String(k + 1).padStart(3, '0'),
+                r.state || '',
+                r.prompt || '',
+                (r.files || []).join(' ; '),
+                r.images || '',
+                r.meta || '',
+                r.session || '',
+                r.at ? new Date(r.at).toLocaleString('zh-CN') : '',
+                r.reason || (r.nativeCount ? '文件由浏览器命名，见会话链接' : '')
+            ].map(csvCell).join(','));
+        });
+        return '\ufeff' + rows.join('\r\n');
+    }
+
+    function buildHtml() {
+        const cards = recordKeys().map((k) => {
+            const r = S.records[k] || {};
+            const ok = r.state === 'ok';
+            const imgs = (r.files || []).map((f) => '<img src="' + esc(f) + '" alt="">').join('');
+            return '<article class="card' + (ok ? '' : ' bad') + '">' +
+                '<div class="hd"><b>' + String(k + 1).padStart(3, '0') + '</b><span>' + esc(r.state || '') + '</span></div>' +
+                (imgs ? '<div class="im">' + imgs + '</div>' : '<div class="im empty">无本地文件</div>') +
+                '<p class="p">' + esc(r.prompt || '') + '</p>' +
+                '<div class="mt">' + esc(r.meta || '') +
+                (r.session ? ' · <a href="' + esc(r.session) + '" target="_blank" rel="noreferrer">回到对话</a>' : '') +
+                (r.reason ? ' · ' + esc(r.reason) : '') +
+                '</div></article>';
+        }).join('');
+
+        return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">' +
+            '<title>Gemini 批量生图对照</title><style>' +
+            'body{margin:0;padding:24px;background:#f6f6f7;color:#1c1c1e;' +
+            'font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}' +
+            'h1{font-size:17px;font-weight:600;margin:0 0 4px}' +
+            '.sub{color:#6b6b73;font-size:12.5px;margin-bottom:18px}' +
+            '.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}' +
+            '.card{background:#fff;border:1px solid #e4e4e8;border-radius:10px;overflow:hidden;display:flex;flex-direction:column}' +
+            '.card.bad{border-color:#f0b4b4;background:#fffafa}' +
+            '.hd{display:flex;justify-content:space-between;padding:8px 10px;font-size:11.5px;color:#6b6b73;border-bottom:1px solid #f0f0f2}' +
+            '.hd b{color:#1c1c1e;font-weight:600}' +
+            '.im{background:#fafafa;display:flex;justify-content:center}' +
+            '.im img{width:100%;display:block}' +
+            '.im.empty{padding:36px 0;color:#a0a0a8;font-size:12px}' +
+            '.p{margin:0;padding:10px 10px 6px;font-size:12.5px;word-break:break-word}' +
+            '.mt{padding:0 10px 10px;color:#8a8a92;font-size:11.5px;word-break:break-all}' +
+            'a{color:#2a6df5;text-decoration:none}' +
+            '</style></head><body>' +
+            '<h1>Gemini 批量生图对照</h1>' +
+            '<div class="sub">共 ' + recordKeys().length + ' 条 · 导出 ' +
+            esc(new Date().toLocaleString('zh-CN')) + ' · 把本文件与图片放在同一目录，缩略图才会显示</div>' +
+            '<div class="grid">' + cards + '</div></body></html>';
+    }
+
+    function exportAs(kind) {
+        if (!recordKeys().length) { log('⚠️ 还没有可导出的记录', 'warn'); return; }
+        if (kind === 'csv') {
+            triggerDownload(new Blob([buildCsv()], { type: 'text/csv;charset=utf-8' }), 'gemini-batch-manifest.csv');
+            log('⬇ 已导出 gemini-batch-manifest.csv');
+        } else {
+            triggerDownload(new Blob([buildHtml()], { type: 'text/html;charset=utf-8' }), 'gemini-batch-index.html');
+            log('⬇ 已导出 gemini-batch-index.html（与图片同目录，双击打开）');
+        }
+        save();
     }
 
     /* ---------------------------------- 主流程 -------------------------------- */
@@ -730,6 +838,7 @@
             S.running = false;
             save(); render();
             log('✅ 队列全部完成');
+            autoExportIfNeeded();
             return;
         }
 
@@ -792,12 +901,22 @@
             }
 
             log(`  出图 ${result.images.length} 张`);
-            let files = 0;
-            if (S.autoDownload) {
-                files = await downloadAll(result.images, idx, prompt);
-            }
+            let saved = [];
+            if (S.autoDownload) saved = await downloadAll(result.images, idx, prompt);
 
-            S.statuses[idx] = { state: files > 0 || !S.autoDownload ? 'ok' : 'fail', files, reason: '' };
+            const owned = (saved || []).filter((r) => r.from !== '按钮');
+            updateRecord(idx, {
+                prompt,
+                state: (saved.length > 0 || !S.autoDownload) ? 'ok' : 'fail',
+                files: owned.map((r) => r.name),
+                nativeCount: saved.length - owned.length,
+                meta: owned[0] && owned[0].meta ? owned[0].meta : '',
+                images: result.images.length,
+                session: /\/app\//.test(location.pathname) ? location.href : '',
+                at: Date.now()
+            });
+
+            S.statuses[idx] = { state: 'ok', files: owned.length, reason: '' };
             S.cursor = idx + 1;
             S.sentAt[idx] = 0;
             save(); render();
@@ -815,6 +934,7 @@
                 S.running = false;
                 save(); render();
                 log('✅ 队列全部完成');
+                autoExportIfNeeded();
             }
         } catch (e) {
             log('✗ 异常：' + (e && e.message ? e.message : e));
@@ -826,6 +946,15 @@
 
     function fail(idx, reason, pause) {
         S.statuses[idx] = { state: 'fail', files: 0, reason };
+        updateRecord(idx, {
+            prompt: S.queue[idx] || '',
+            state: 'fail',
+            reason,
+            files: [],
+            meta: '',
+            session: /\/app\//.test(location.pathname) ? location.href : '',
+            at: Date.now()
+        });
         S.cursor = idx + 1;
         S.sentAt[idx] = 0;
         if (pause) {
@@ -1015,6 +1144,10 @@
             h('div', { class: 'row' },
                 h('button', { class: 'btn', id: 'btnProbe', text: '自检当前页面' }),
                 h('button', { class: 'btn', id: 'btnCopyLog', text: '复制日志' })
+            ),
+            h('div', { class: 'row' },
+                h('button', { class: 'btn', id: 'btnCsv', text: '导出清单' }),
+                h('button', { class: 'btn', id: 'btnHtml', text: '对照页' })
             )
         );
 
@@ -1078,7 +1211,7 @@
             pillText: $('pillText'), head: $('head'), btnMin: $('btnMin'), btnHide: $('btnHide'),
             cfgDelay: $('cfgDelay'), cfgTimeout: $('cfgTimeout'),
             cfgNewChat: $('cfgNewChat'), cfgAutoDl: $('cfgAutoDl'), btnProbe: $('btnProbe'),
-            btnCopyLog: $('btnCopyLog')
+            btnCopyLog: $('btnCopyLog'), btnCsv: $('btnCsv'), btnHtml: $('btnHtml')
         };
 
         ui.ta.value = S.raw;
@@ -1118,7 +1251,7 @@
         });
         ui.btnReset.addEventListener('click', () => {
             if (!confirm('清空队列与所有进度？')) return;
-            S = Object.assign({}, DEFAULTS, { raw: '', cursor: 0, statuses: [], sentAt: {}, queue: [] });
+            S = Object.assign({}, DEFAULTS, { raw: '', cursor: 0, statuses: [], sentAt: {}, records: {}, queue: [], exported: false });
             ui.ta.value = '';
             save(); render();
             log('已清空');
@@ -1131,6 +1264,8 @@
         ui.cfgAutoDl.addEventListener('change', () => { S.autoDownload = ui.cfgAutoDl.checked; save(); });
         ui.btnProbe.addEventListener('click', probe);
         ui.btnCopyLog.addEventListener('click', copyLog);
+        ui.btnCsv.addEventListener('click', () => exportAs('csv'));
+        ui.btnHtml.addEventListener('click', () => exportAs('html'));
 
         // 收起 / 隐藏 / 拖动
         ui.btnMin.addEventListener('click', () => { S.minimized = true; save(); render(); });
@@ -1344,6 +1479,8 @@
                 minimized: S.minimized
             }),
             probe: () => probe(),
+            csv: () => buildCsv(),
+            html: () => buildHtml(),
             show: () => {
                 S.minimized = false;
                 const h = document.getElementById('gib-host');
