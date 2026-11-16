@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.6.3
+// @version      1.6.4
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.6.3';
+    const VER = '1.6.4';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -906,6 +906,7 @@
 
         const cap = await captureDownload(() => ctrl.click(), baseName);
         if (!cap.renamed && !cap.href) { S.capFail = true; save(); }
+        log(`  捕捉结果：链接${cap.href ? '有' : '无'} · 改名${cap.renamed ? '成功' : '未成功'}${cap.newWindow ? ' · 新窗口' : ''}${cap.renameFailed ? ' · 跨域' : ''} · 页面blob${cap.blob ? '有' : '无'}`);
 
         if (cap.renamed) {
             log('  ✓ 已改名为 ' + baseName + '，由浏览器下载');
