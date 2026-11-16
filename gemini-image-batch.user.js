@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.0.7
+// @version      1.0.8
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.0.7';
+    const VER = '1.0.8';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -451,6 +451,71 @@
         return dim ? dim + ' · ' + mb : mb;
     }
 
+    /**
+     * 页面的「Download full size」最终无非三种出口：createObjectURL 生成 blob、
+     * 造一个 <a download> 去点、或 window.open。临时接管这三处，就能在它下载前
+     * 把真正的原图截下来，我们自己做命名。
+     */
+    async function captureDownload(trigger) {
+        const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+        const cap = { blob: null, href: null, name: '' };
+        const saved = { create: null, click: null, open: null };
+
+        try {
+            saved.create = uw.URL.createObjectURL;
+            uw.URL.createObjectURL = function (b) {
+                try {
+                    if (b && /^image\//i.test(b.type) && b.size > 4096) {
+                        if (!cap.blob || b.size > cap.blob.size) cap.blob = b;
+                    }
+                } catch (e) { }
+                return saved.create.apply(this, arguments);
+            };
+        } catch (e) { }
+
+        try {
+            const proto = uw.HTMLAnchorElement && uw.HTMLAnchorElement.prototype;
+            if (proto) {
+                saved.click = proto.click;
+                proto.click = function () {
+                    try {
+                        const h = this.href || '';
+                        if (!cap.href && (/^blob:/.test(h) || /googleusercontent|^https?:.*\.(jpg|jpeg|png|webp)/i.test(h))) {
+                            cap.href = h;
+                            cap.name = this.download || '';
+                            return; // 拦下，稍后自己保存
+                        }
+                    } catch (e) { }
+                    return saved.click.apply(this, arguments);
+                };
+            }
+        } catch (e) { }
+
+        try {
+            saved.open = uw.open;
+            uw.open = function (url) {
+                try {
+                    const u = String(url || '');
+                    if (/^blob:|googleusercontent/.test(u)) { if (!cap.href) cap.href = u; return null; }
+                } catch (e) { }
+                return saved.open.apply(this, arguments);
+            };
+        } catch (e) { }
+
+        try { trigger(); } catch (e) { }
+
+        const t0 = Date.now();
+        while (!cap.blob && !cap.href && Date.now() - t0 < 3500) await sleep(250);
+
+        try {
+            if (saved.create) uw.URL.createObjectURL = saved.create;
+            if (saved.click && uw.HTMLAnchorElement) uw.HTMLAnchorElement.prototype.click = saved.click;
+            if (saved.open) uw.open = saved.open;
+        } catch (e) { }
+
+        return cap;
+    }
+
     /** 保存单张：优先原图，绝不落 webp */
     async function saveOneImage(img, baseName) {
         if (!img || !img.src) throw new Error('图片元素无效');
@@ -472,22 +537,25 @@
             } catch (e) { }
         }
 
-        // 2) 用页面自带的「Download full size」，让 Google 给原始文件
+        // 2) 劫持「Download full size」背后的真实文件，自己命名保存
         await revealToolbar(scope);
         const ctrl = findDownloadControl(scope);
         if (ctrl) {
-            const href = ctrl.tagName === 'A' ? ctrl.href : null;
-            if (href) {
-                try {
-                    const blob = await fetchBlob(href);
-                    const out = GOOD_TYPES.test(blob.type) ? blob : await toPng(blob);
-                    const name = baseName + '.' + mimeToExt(out.type);
-                    triggerDownload(out, name);
-                    return { name, from: '原图', meta: await blobMeta(blob) };
-                } catch (e) { }
+            const cap = await captureDownload(() => ctrl.click());
+            let blob = cap.blob;
+            if (!blob && cap.href) {
+                try { blob = await fetchBlob(cap.href); } catch (e) { }
             }
-            ctrl.click();
-            return { name: '（已由页面下载原图，文件名由 Google 生成）', from: '按钮' };
+            if (blob) {
+                const out = GOOD_TYPES.test(blob.type) ? blob : await toPng(blob);
+                const name = baseName + '.' + mimeToExt(out.type);
+                triggerDownload(out, name);
+                return { name, from: '原图', meta: await blobMeta(out) };
+            }
+            // 没截到（可能是别的下载方式），退回原生点击，至少把图拿到
+            await sleep(200);
+            try { ctrl.click(); } catch (e) { }
+            return { name: '（页面原生下载，文件名由 Google 生成）', from: '按钮' };
         }
 
         // 3) 兜底：webp 转 png
@@ -1099,6 +1167,7 @@
         log('停止键: ' + (stop ? '存在' : '不存在'));
         log('Images 标签: ' + (mode.chip ? '已选中' : '未检测到') + ' / 占位提示: ' + (mode.textHint ? '像生图页' : '不像'));
         log('当前识别到图片: ' + imgs.length + ' 张');
+        if (imgs[0] && imgs[0].src) log('首图地址: ' + imgs[0].src.slice(0, 150));
         const ed = box && box.getAttribute('aria-label');
         if (ed) log('输入框 aria-label: ' + ed);
     }
