@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.8.1
+// @version      1.8.2
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.8.1';
+    const VER = '1.8.2';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -583,7 +583,7 @@
         pendingUndo = [];
     }
 
-    async function captureDownload(trigger, wantName) {
+    async function captureDownload(trigger, wantName, maxWaitMs) {
         const uw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
         const cap = {
             blob: null, href: null, name: '', urls: [], rpc: [], found: [], rpcCalls: [],
@@ -726,7 +726,7 @@
             try { trigger(); } catch (e) { }
             const t0 = Date.now();
             // 实测点击后约 35 秒才真正下载；一旦某轮抓不到就缩短后续等待
-            const waitMs = S.capFail ? 12000 : 60000;
+            const waitMs = maxWaitMs || (S.capFail ? 12000 : 60000);
             while (Date.now() - t0 < waitMs) {
                 if (cap.renamed || cap.href || cap.frameSrc || cap.rpcText) break;
                 await sleep(300);
@@ -918,16 +918,36 @@
         if (!img || !img.src) throw new Error('图片元素无效');
         const scope = imageScope(img);
 
-        const ctrl = await waitDownloadReady(scope, 30000);
-        if (!ctrl) throw new Error('下载按钮未就绪');
+        // 点一次看结果：页面报'无法下载'就等一会重试，不靠定时猜
+        const errRe = /(couldn.t download|unable to download|无法下载|下载失败)/i;
+        const countErr = () => {
+            const t = document.body.innerText || '';
+            const m = t.match(new RegExp(errRe.source, 'gi'));
+            return m ? m.length : 0;
+        };
 
-        const cap = await captureDownload(() => ctrl.click(), baseName);
-        if (!cap.renamed && !cap.href && !cap.rpcText) { S.capFail = true; save(); }
-        log(`  捕捉结果：链接${cap.href ? '有' : '无'} · 改名${cap.renamed ? '成功' : '未成功'}${cap.newWindow ? ' · 新窗口' : ''}${cap.renameFailed ? ' · 跨域' : ''} · 页面blob${cap.blob ? '有' : '无'}`);
+        let clicked = false;
+        for (let attempt = 1; attempt <= 6; attempt++) {
+            const btn = await waitDownloadReady(scope, 15000);
+            if (!btn) { log('  ⚠️ 下载按钮始终不可点', 'warn'); break; }
 
-        if (cap.renamed) {
-            log('  ✓ 已改名为 ' + baseName + '，由浏览器下载');
-            return { name: baseName, from: '浏览器下载', meta: '' };
+            const before = countErr();
+            const cap = await captureDownload(() => btn.click(), baseName, 3000);
+            clicked = true;
+
+            if (cap.renamed) {
+                log('  ✓ 已改名为 ' + baseName + '，由浏览器下载');
+                return { name: baseName, from: '浏览器下载', meta: '' };
+            }
+
+            await sleep(2000);
+            if (countErr() > before) {
+                log(`  第 ${attempt} 次点击后页面提示无法下载，等 5 秒重试`, 'warn');
+                await sleep(5000);
+                continue;
+            }
+            log('  ✓ 已触发浏览器下载（第 ' + attempt + ' 次点击）');
+            return { name: '（浏览器下载，文件名由 Google 生成）', from: '浏览器下载', meta: '' };
         }
 
         // 兜底：让浏览器自己下一次，保证这一轮不空手
