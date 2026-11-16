@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
-// @namespace    https://github.com/chenjunqiang/gemini-image-batch
+// @namespace    https://github.com/ercichen12/gemini-image-batch
 // @version      1.0.0
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results

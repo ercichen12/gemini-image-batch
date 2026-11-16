@@ -32,7 +32,7 @@
 2. 点开脚本直链，Tampermonkey 会自动弹出安装页：
 
 ```
-https://raw.githubusercontent.com/chenjunqiang/gemini-image-batch/main/gemini-image-batch.user.js
+https://raw.githubusercontent.com/ercichen12/gemini-image-batch/main/gemini-image-batch.user.js
 ```
 
 3. 点「安装」
