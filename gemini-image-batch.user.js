@@ -2,15 +2,17 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.5.0
+// @version      1.5.2
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
 // @match        https://gemini.google.com/*
 // @grant        GM_download
+// @grant        GM_xmlhttpRequest
 // @connect      googleusercontent.com
 // @connect      lh3.googleusercontent.com
 // @connect      *.googleusercontent.com
+// @connect      gemini.google.com
 // @noframes
 // @run-at       document-idle
 // ==/UserScript==
@@ -21,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.5.0';
+    const VER = '1.5.2';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -394,12 +396,50 @@
         return blob;
     }
 
+    /** 扩展层取字节，绕开页面 CORS */
+    function gmFetchBlob(url) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                reject(new Error('GM_xmlhttpRequest 不可用'));
+                return;
+            }
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                responseType: 'arraybuffer',
+                timeout: 30000,
+                onload: (r) => {
+                    if (r.status >= 400) { reject(new Error('HTTP ' + r.status)); return; }
+                    const buf = r.response;
+                    if (!buf || buf.byteLength < 4096) { reject(new Error('响应过小')); return; }
+                    let type = 'application/octet-stream';
+                    const m = /content-type:\s*([^\r\n;]+)/i.exec(r.responseHeaders || '');
+                    if (m) type = m[1].trim();
+                    resolve(new Blob([buf], { type: type }));
+                },
+                onerror: () => reject(new Error('网络错误')),
+                ontimeout: () => reject(new Error('超时'))
+            });
+        });
+    }
+
     async function fetchBlob(url) {
-        const res = await fetch(url, { credentials: 'include' });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const blob = await res.blob();
-        if (blob.size < 2048) throw new Error('响应过小');
-        return await sniffImage(blob);
+        try {
+            const res = await fetch(url, { credentials: 'include' });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const blob = await res.blob();
+            if (blob.size < 2048) throw new Error('响应过小');
+            return await sniffImage(blob);
+        } catch (e) {
+            // 页面内取不到（多半是跨域），交给扩展再试一次
+            try {
+                const gm = await gmFetchBlob(url);
+                if (gm.size < 2048) throw new Error('响应过小');
+                return await sniffImage(gm);
+            } catch (e2) {
+                throw new Error((e.message || e) + ' / 扩展取图：' + (e2.message || e2));
+            }
+        }
     }
 
     const GOOD_TYPES = /^image\/(png|jpeg|jpg)$/i;
@@ -854,19 +894,23 @@
                 try {
                     const text = await replayRpc(cap.rpcCalls[c]);
                     const cand = rpcCandidates(text);
-                    log(`  RPC 重放：${(text.length / 1024).toFixed(0)}KB，地址 ${cand.urls.length} 个${cand.b64 ? '，含内嵌图' : ''}`);
+                    log(`  RPC 重放：${text.length}B，地址 ${cand.urls.length} 个${cand.b64 ? '，内嵌图 ' + Math.round(cand.b64.length / 1024) + 'KB' : ''}`);
+                    if (cand.urls.length) log('  RPC 地址：' + cand.urls[0].slice(0, 160));
                     for (let u = 0; u < cand.urls.length; u++) {
-                        try { addCand(await fetchBlob(cand.urls[u]), 'RPC地址'); } catch (e) { }
+                        try { addCand(await fetchBlob(cand.urls[u]), 'RPC地址'); }
+                        catch (e) { log('  RPC 地址取图失败：' + (e.message || e), 'warn'); }
                     }
                     if (cand.b64) {
-                        try { addCand(await sniffImage(b64ToBlob(cand.b64)), 'RPC内嵌图'); } catch (e) { }
+                        try { addCand(await sniffImage(b64ToBlob(cand.b64)), 'RPC内嵌图'); }
+                        catch (e) { log('  RPC 内嵌图解码失败：' + (e.message || e), 'warn'); }
                     }
                 } catch (e) {
                     log('  RPC 重放失败：' + (e.message || e));
                 }
             }
             for (let k = 0; k < cap.found.length; k++) {
-                try { addCand(await fetchBlob(cap.found[k]), 'RPC响应地址'); } catch (e) { }
+                try { addCand(await fetchBlob(cap.found[k]), 'RPC响应地址'); }
+                catch (e) { log('  RPC 响应地址取图失败：' + (e.message || e), 'warn'); }
             }
             if (!cands.length && cap.urls.length) {
                 log('  点击触发：' + cap.urls.slice(0, 2).join(' ｜ ').slice(0, 200));
@@ -897,7 +941,7 @@
             if (best) {
                 log(`  ⚠️ 最大只到 ${best.w}×${best.h}，低于原图阈值 ${MIN_FULL_W}px，改走原生下载`, 'warn');
             }
-            if (!blob && cap.rpcCalls.length === 0) {
+            if (!cands.length && cap.rpcCalls.length === 0) {
                 log('  ⚠️ 未取到下载请求体（可能是 Request 对象或二进制体）', 'warn');
             }
             if (cap.suppressed) log('  已接管下载接口，但没从中解析出图片', 'warn');
