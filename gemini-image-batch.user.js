@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.0.5
+// @version      1.0.6
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -21,7 +21,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.0.5';
+    const VER = '1.0.6';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -440,6 +440,17 @@
         await sleep(500);
     }
 
+    /** 记录尺寸和体积，用来自证取到的是不是原图 */
+    async function blobMeta(blob) {
+        let dim = '';
+        try {
+            const bmp = await createImageBitmap(blob);
+            dim = bmp.width + '×' + bmp.height;
+        } catch (e) { }
+        const mb = (blob.size / 1048576).toFixed(2) + 'MB';
+        return dim ? dim + ' · ' + mb : mb;
+    }
+
     /** 保存单张：优先原图，绝不落 webp */
     async function saveOneImage(img, baseName) {
         if (!img || !img.src) throw new Error('图片元素无效');
@@ -455,7 +466,7 @@
                 if (GOOD_TYPES.test(blob.type)) {
                     const name = baseName + '.' + mimeToExt(blob.type);
                     triggerDownload(blob, name);
-                    return { name, from: '原图' };
+                    return { name, from: '原图', meta: await blobMeta(blob) };
                 }
                 fallback = blob; // 还是 webp，先留着备用
             } catch (e) { }
@@ -472,7 +483,7 @@
                     const out = GOOD_TYPES.test(blob.type) ? blob : await toPng(blob);
                     const name = baseName + '.' + mimeToExt(out.type);
                     triggerDownload(out, name);
-                    return { name, from: '原图' };
+                    return { name, from: '原图', meta: await blobMeta(blob) };
                 } catch (e) { }
             }
             ctrl.click();
@@ -484,7 +495,7 @@
             const png = await toPng(fallback);
             const name = baseName + '.png';
             triggerDownload(png, name);
-            return { name, from: 'webp转png' };
+            return { name, from: 'webp转png', meta: await blobMeta(png) };
         }
 
         // 4) 最后才用预览图本身
@@ -493,7 +504,7 @@
             const out = GOOD_TYPES.test(blob.type) ? blob : await toPng(blob);
             const name = baseName + '.' + mimeToExt(out.type);
             triggerDownload(out, name);
-            return { name, from: '预览图' };
+            return { name, from: '预览图', meta: await blobMeta(out) };
         } catch (e) {
             if (typeof GM_download === 'function') {
                 const name = baseName + '.png';
@@ -501,7 +512,7 @@
                     try { GM_download({ url: full, name, saveAs: false, onload: res, onerror: rej }); }
                     catch (err) { rej(err); }
                 });
-                return { name, from: 'GM_download' };
+                return { name, from: 'GM_download', meta: '' };
             }
             throw new Error('取图失败');
         }
@@ -515,7 +526,7 @@
             try {
                 const r = await saveOneImage(images[i].el, base + suffix);
                 ok++;
-                log(`⬇ 已保存 ${r.name}（${r.from}）`);
+                log(`⬇ 已保存 ${r.name}（${r.from}${r.meta ? ' ' + r.meta : ''}）`);
                 await sleep(r.from === '按钮' ? 900 : 400);
             } catch (e) {
                 log(`✗ 第 ${i + 1} 张保存失败：${e.message || e}`);
