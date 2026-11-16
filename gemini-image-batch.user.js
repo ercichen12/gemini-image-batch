@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.8.2
+// @version      1.9.0
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.8.2';
+    const VER = '1.9.0';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -1040,7 +1040,7 @@
                 '<div class="hd"><b>' + String(k + 1).padStart(3, '0') + '</b><span>' + esc(r.state || '') + '</span></div>' +
                 (imgs ? '<div class="im">' + imgs + '</div>' : '<div class="im empty">未保存到本地 · 可用下方链接回原对话取图</div>') +
                 '<p class="p">' + esc(r.prompt || '') + '</p>' +
-                '<div class="mt">' + esc(r.meta || '') +
+                '<div class="mt">' + (r.at ? esc(new Date(r.at).toLocaleString('zh-CN')) + ' · ' : '') + esc(r.meta || '') +
                 (r.session ? ' · <a href="' + esc(r.session) + '" target="_blank" rel="noreferrer">回到对话</a>' : '') +
                 (r.reason ? ' · ' + esc(r.reason) : '') +
                 '</div></article>';
@@ -1066,7 +1066,7 @@
             '</style></head><body>' +
             '<h1>Gemini 批量生图对照</h1>' +
             '<div class="sub">共 ' + recordKeys().length + ' 条 · 导出 ' +
-            esc(new Date().toLocaleString('zh-CN')) + ' · 把本文件与图片放在同一目录，缩略图才会显示</div>' +
+            esc(new Date().toLocaleString('zh-CN')) + ' · 图片由浏览器下载，文件名由 Google 生成；<b>在下载目录按「修改时间」排序，即与下面序号一一对应</b></div>' +
             '<div class="grid">' + cards + '</div></body></html>';
     }
 
