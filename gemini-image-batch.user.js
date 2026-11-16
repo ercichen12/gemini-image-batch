@@ -263,14 +263,25 @@
 
     /* -------------------------------- 出图检测 -------------------------------- */
 
+    // 发送前页面上已存在的图片（模板缩略图、上几轮的结果），一律不算本轮产出
+    let baseline = new Set();
+
+    function snapshotBaseline() {
+        baseline = new Set();
+        for (const img of document.querySelectorAll('img')) {
+            const src = img.currentSrc || img.src || '';
+            if (src) baseline.add(src);
+        }
+    }
+
     function collectImages() {
         const out = [];
         const seen = new Set();
         for (const img of document.querySelectorAll('img')) {
             const src = img.currentSrc || img.src || '';
             if (!src) continue;
+            if (baseline.has(src)) continue;
             if (!/^blob:|googleusercontent\.com|gstatic\.com\/image/.test(src)) continue;
-            if (/^data:/.test(src) && src.length < 5000) continue;
             if (img.naturalWidth < 256 || img.naturalHeight < 256) continue;
             if (img.closest('nav, header, [role="navigation"], side-navigation, .side-nav, #gib-host')) continue;
             if (!isVisible(img)) continue;
@@ -422,6 +433,8 @@
                 return;
             }
 
+            snapshotBaseline();
+
             // 刷新后重入：这条已经发过了，只等结果，避免重复提交
             const sentAgo = S.sentAt[idx] ? Date.now() - S.sentAt[idx] : Infinity;
             const resuming = sentAgo < 10 * 60 * 1000 && /\/app\//.test(location.pathname);
@@ -435,13 +448,14 @@
                 if (!box) return fail(idx, '找不到输入框');
 
                 const mode = imagesModeState();
-                if (!mode.chip && !mode.textHint) {
+                if (!mode.chip && !mode.textHint && !mode.onImagesPath) {
                     log('⚠️ 未见 Images 标签，尝试主动选中 …');
                     const ok = await activateImagesTool();
                     if (!ok) log('⚠️ 仍无法确认生图模式，继续尝试提交');
                     else log('✓ 已切到生图模式');
                 }
 
+                snapshotBaseline();
                 if (!fillComposer(box, prompt)) {
                     await sleep(400);
                     if (!fillComposer(box, prompt)) return fail(idx, '写入提示词失败');
@@ -455,6 +469,7 @@
                 log('  已发送，等待出图 …');
             } else {
                 log(`↻ 检测到第 ${idx + 1} 条已提交，继续等待出图 …`);
+                baseline = new Set();
             }
 
             const result = await waitImages();
