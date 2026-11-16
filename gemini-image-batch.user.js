@@ -2,7 +2,7 @@
 // @name         Gemini 批量生图队列
 // @name:en      Gemini Batch Image Queue
 // @namespace    https://github.com/ercichen12/gemini-image-batch
-// @version      1.6.2
+// @version      1.6.3
 // @description  一次性粘贴 N 条生图提示词，在 gemini.google.com/images 逐条自动提交并下载生成的图片
 // @description:en Paste N image prompts at once, auto-submit them one by one on Gemini and download results
 // @author       ercichen12
@@ -23,7 +23,7 @@
     const NS = '__GIB_LOADED__';
     if (window[NS]) return;
     window[NS] = true;
-    const VER = '1.6.2';
+    const VER = '1.6.3';
     try { console.info('[GIB] 批量生图脚本已注入 v' + VER); } catch (e) { }
 
     const IMAGES_URL = 'https://gemini.google.com/images';
@@ -488,7 +488,7 @@
         return find(scope) || find(document.body);
     }
 
-    async function revealToolbar(scope) {
+    function hoverScope(scope) {
         const types = ['pointerenter', 'pointerover', 'mouseenter', 'mouseover', 'mousemove'];
         const targets = [scope].concat(Array.from(scope.querySelectorAll('img')).slice(0, 2));
         targets.forEach((n) => {
@@ -496,7 +496,39 @@
                 try { n.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })); } catch (e) { }
             });
         });
+    }
+
+    async function revealToolbar(scope) {
+        hoverScope(scope);
         await sleep(500);
+    }
+
+    function isDisabled(el) {
+        if (!el) return true;
+        if (el.disabled) return true;
+        if (el.getAttribute('aria-disabled') === 'true') return true;
+        try {
+            const st = getComputedStyle(el);
+            if (st.pointerEvents === 'none' || st.opacity === '0') return true;
+        } catch (e) { }
+        return false;
+    }
+
+    /** 轮询到下载按钮真的可点再返回；不靠定时猜 */
+    async function waitDownloadReady(scope, timeoutMs) {
+        const t0 = Date.now();
+        let why = '未找到下载按钮';
+        while (Date.now() - t0 < timeoutMs) {
+            hoverScope(scope);
+            const btn = findDownloadControl(scope);
+            if (btn) {
+                if (!isDisabled(btn)) return btn;
+                why = '按钮处于禁用态';
+            }
+            await sleep(400);
+        }
+        log(`  ⚠️ 下载按钮 ${Math.round(timeoutMs / 1000)} 秒内未就绪（${why}）`, 'warn');
+        return null;
     }
 
     const MIN_FULL_W = 1500;
@@ -869,12 +901,8 @@
         if (!img || !img.src) throw new Error('图片元素无效');
         const scope = imageScope(img);
 
-        let ctrl = null;
-        try {
-            await revealToolbar(scope);
-            ctrl = findDownloadControl(scope);
-        } catch (e) { }
-        if (!ctrl) throw new Error('找不到下载按钮');
+        const ctrl = await waitDownloadReady(scope, 30000);
+        if (!ctrl) throw new Error('下载按钮未就绪');
 
         const cap = await captureDownload(() => ctrl.click(), baseName);
         if (!cap.renamed && !cap.href) { S.capFail = true; save(); }
@@ -1131,10 +1159,6 @@
             }
 
             log(`  出图 ${result.images.length} 张`);
-            if (S.autoDownload) {
-                log('  等 6 秒让页面就绪再下载 …');
-                await sleep(6000);
-            }
             let saved = [];
             if (S.autoDownload) saved = await downloadAll(result.images, idx, prompt);
 
